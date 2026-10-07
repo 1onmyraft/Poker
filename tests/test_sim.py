@@ -7,6 +7,7 @@ from sim.stats import StatsTracker
 from sim.strength import postflop_strength
 from sim.handhistory import parse_hands, replay, generate, write_hand
 from sim.backtest import backtest, score
+from sim.calibrate import target_from, distance
 
 
 class Scripted(Bot):
@@ -242,6 +243,20 @@ class TestHandHistory(unittest.TestCase):
         self.assertEqual(s['agree']['preflop'], s['total']['preflop'])   # deterministic preflop
         n = score(rows, 'Nit')
         self.assertLess(n['agree']['preflop'], n['total']['preflop'])
+
+
+class TestCalibrate(unittest.TestCase):
+
+    def test_distance_is_zero_on_itself_and_grows(self):
+        tr = StatsTracker()
+        table = Table()
+        bots = [make_bot('Scared', 'a'), make_bot('Maniac', 'b')]
+        for d in range(400):
+            tr.update(table.play_hand(bots if d % 2 else bots[::-1], deck_seed=d))
+        t = target_from(tr.get('a'))
+        self.assertIn('vpip', t)
+        self.assertAlmostEqual(distance(tr.get('a'), t), 0.0)
+        self.assertGreater(distance(tr.get('b'), t), 50)
 
 
 if __name__ == '__main__':

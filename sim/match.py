@@ -45,7 +45,8 @@ def paired_diff(a, b, lo=0, hi=None):
     return 100 * sum(d) / len(d), 1.96 * 100 * _se(d)
 
 
-def run_match(lineup, n_deals, seed=0, duplicate=True, stack_bb=100, big_blind=2, allin_ev=True):
+def run_match(lineup, n_deals, seed=0, duplicate=True, stack_bb=100, big_blind=2, allin_ev=True,
+              small_blind=None, ante=0, rake=0.0, rake_cap=None, stack_range=None, params=None):
     '''
     PARAMETERS:
         lineup: list of (kind, name) pairs, kind is 'Exploit' or a PRESETS key
@@ -53,12 +54,22 @@ def run_match(lineup, n_deals, seed=0, duplicate=True, stack_bb=100, big_blind=2
         seed: base seed; the same seed gives the same deals for any lineup of the same size
         allin_ev: score hands where players were all-in before the river by equity
                   instead of the actual runout (unbiased, much lower variance)
+        ante, rake, rake_cap, small_blind: table structure (see engine.Table)
+        stack_range: (lo, hi) in big blinds; each deal draws random stacks per seat,
+                     kept identical across the duplicate rotations
+        params: optional {name: Params} overriding presets (for fitted bots)
 
     RETURN: MatchResult
     '''
-    bots = [make_bot(kind, name, seed=seed * 1000 + i) for i, (kind, name) in enumerate(lineup)]
+    import random
+    from .bots import ParamBot
+    params = params or {}
+    bots = [ParamBot(name, params[kind], seed=seed * 1000 + i) if kind in params
+            else make_bot(kind, name, seed=seed * 1000 + i) for i, (kind, name) in enumerate(lineup)]
     n = len(bots)
-    table = Table(big_blind=big_blind, stack_bb=stack_bb)
+    table = Table(big_blind=big_blind, small_blind=small_blind, stack_bb=stack_bb, ante=ante,
+                  rake=rake, rake_cap=rake_cap)
+    stack_rng = random.Random(seed * 7 + 3)
     observer = StatsTracker()
     blocks = {b.name: [] for b in bots}
     rotations = n if duplicate else 1
@@ -66,10 +77,12 @@ def run_match(lineup, n_deals, seed=0, duplicate=True, stack_bb=100, big_blind=2
     for d in range(n_deals):
         deck_seed = seed * 10_000_000 + d
         net = [0.0] * n
+        stacks = ([big_blind * stack_rng.randint(*stack_range) for _ in range(n)]
+                  if stack_range else None)
         for r in range(rotations):
             rot = r if duplicate else d % n
             order = [bots[(j + rot) % n] for j in range(n)]
-            h = table.play_hand(order, deck_seed, hand_id)
+            h = table.play_hand(order, deck_seed, hand_id, stacks=stacks)
             hand_id += 1
             observer.update(h)
             result = h.ev_winnings if (allin_ev and h.ev_winnings) else h.winnings

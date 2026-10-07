@@ -199,18 +199,25 @@ class ExploitBot(ParamBot):
     # adjustment groups, individually switchable for ablation tests
     GROUPS = ('steal', 'threebet', 'vs3bet', 'bluff', 'value', 'call', 'sizing')
 
-    def __init__(self, name, params=PRESETS['TAG'], seed=0, k_conf=30, strength=1.0, disabled=()):
+    def __init__(self, name, params=PRESETS['TAG'], seed=0, k_conf=30, strength=1.0, disabled=(),
+                 pool_mode=False):
         super().__init__(name, params, seed)
         self.tracker = StatsTracker()
         self.k = k_conf
         self.strength = strength   # 0 = pure baseline, 1 = full exploitation
         self.disabled = set(disabled)
+        # pool_mode: opponents are anonymous (names change every hand), so model them
+        # all as one "Pool" player, which is all an anonymous table allows
+        self.pool_mode = pool_mode
 
     def end_hand(self, h):
+        if self.pool_mode:
+            h = replace(h, names=[nm if nm == self.name else 'Pool' for nm in h.names])
         self.tracker.update(h)
 
     def _opp(self, st, seat):
-        return self.tracker.get(st.names[seat])
+        return self.tracker.get('Pool' if self.pool_mode and st.names[seat] != self.name
+                                else st.names[seat])
 
     def _others(self, st):
         return [self._opp(st, i) for i in st.active_seats if i != st.seat]
@@ -344,6 +351,8 @@ def make_bot(kind, name=None, seed=0):
     name = name or kind
     if kind == 'Exploit':
         return ExploitBot(name, seed=seed)
+    if kind == 'ExploitPool':
+        return ExploitBot(name, seed=seed, pool_mode=True)
     if kind.startswith('Exploit-'):
         return ExploitBot(name, seed=seed, disabled=kind.split('-')[1:])
     return ParamBot(name, PRESETS[kind], seed=seed)
