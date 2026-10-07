@@ -4,6 +4,22 @@
 
 This is a simple Texas Hold 'em game running on MacOS. All scripts are written in pure Python. The main GUI is written using the Python module `PySimpleGUI`, and hand evaluation is done by refering to a hand value table pre-calculated together with Monte Carlo simulation. See [here](https://allenfrostline.com/2019/04/09/texas-holdem-series-4/) for detailed explanation of hand evaluation. Together with the GUI version, I also include here a primitive commmandline version with `ColorPrint` support, which you may download and include from this [repo](https://github.com/allenfrostline/Python-Color-Print). The two versions are supposed to work identically.
 
+### Bot simulator (`sim/`)
+
+A headless, dependency-free no-limit hold'em simulator for tuning bots (no GUI, no `hv.json` needed):
+
+- `sim/engine.py`: NLHE rules engine (blinds, min-raise, short all-ins, side pots, all-in EV) that records structured hand histories.
+- `sim/stats.py`: HUD-style tendency stats (VPIP, PFR, 3-bet, steal, fold-to-steal, c-bet, fold-to-c-bet, fold-vs-bet, AFq, WTSD, W$SD), tracked as count/opportunity pairs with small-sample shrinkage.
+- `sim/bots.py`: rule bots (TAG, LAG, Nit, Station, Maniac, plus three levels of low-skill "scared" bots: Nervous, Scared, Terrified) and `ExploitBot`, which models opponents from its own stats tracker using public information only.
+- `sim/match.py`: duplicate-dealing match runner reporting bb/100 with 95% confidence intervals.
+- `sim/experiments.py`: the standard experiment suite; see [`sim/RESULTS.md`](sim/RESULTS.md) for the latest numbers.
+
+```
+python -m sim.experiments              # full suite, ~5 min on 4 cores
+python -m sim.experiments --scale 0.1  # quick run
+python -m unittest tests.test_sim
+```
+
 ### Usage
 
 You don't need any Python or module dependencies installed on your Mac in order to just play the game. The app itself is standalone with everything packed inside it already. There're just two steps:
