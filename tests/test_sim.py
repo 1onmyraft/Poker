@@ -5,6 +5,8 @@ from sim.engine import Table, Action, FOLD, CHECK, CALL, BET, RAISE
 from sim.bots import Bot, make_bot, PRESETS
 from sim.stats import StatsTracker
 from sim.strength import postflop_strength
+from sim.handhistory import parse_hands, replay, generate, write_hand
+from sim.backtest import backtest, score
 
 
 class Scripted(Bot):
@@ -149,6 +151,97 @@ class TestStats(unittest.TestCase):
         # one observation barely moves the shrunk estimate off the prior
         self.assertLess(pa.rate('fold_3bet', k=20), 0.6)
         self.assertEqual(pa.rate('fold_3bet', shrink=False), 1.0)
+
+
+SNIPPET = """1onmyraftpoker Hand #1: NLH (₮0.10/₮0.10/₮0.10) 2026/10/07 00:33:33 PDT
+Table '1' 7-max Seat #3 is the button
+Seat 1: aaaaaaaa (₮20 in chips)
+Seat 3: bbbbbbbb (₮5 in chips)
+Seat 4: cccccccc (₮8 in chips)
+Seat 5: Hero (₮10 in chips)
+Seat 6: dddddddd (₮12 in chips)
+aaaaaaaa: posts ante ₮0.10
+bbbbbbbb: posts ante ₮0.10
+cccccccc: posts ante ₮0.10
+Hero: posts ante ₮0.10
+dddddddd: posts ante ₮0.10
+cccccccc: posts small blind ₮0.10
+Hero: posts big blind ₮0.10
+aaaaaaaa: posts auto big blind ₮0.10
+*** HOLE CARDS ***
+Dealt to aaaaaaaa
+Dealt to bbbbbbbb
+Dealt to cccccccc
+Dealt to Hero [Ah Kd]
+Dealt to dddddddd
+dddddddd: STRADDLE ₮0.20
+aaaaaaaa: raises ₮0.40 to ₮0.60
+bbbbbbbb: folds
+cccccccc: folds
+Hero: ALLIN ₮9.80
+dddddddd: folds
+aaaaaaaa: calls ₮9.30
+*** FLOP *** [2c 7d 9h]
+*** TURN *** [2c 7d 9h] [Js]
+*** RIVER *** [2c 7d 9h Js] [3s]
+*** SHOWDOWN ***
+aaaaaaaa: shows [Qs Qd] (One Pair)
+aaaaaaaa collected ₮19.57 from pot
+Hero cashed out the hand for ₮6 | Cash Out Fee ₮0.20
+Hero: shows [Ah Kd] (High Card)
+*** SUMMARY ***
+Total pot ₮20.60 | Rake ₮1.03
+Hand was run once
+Board [ 2c 7d 9h Js 3s ]
+Game ended: 2026/10/07 00:34:33 PDT
+Seat 1: aaaaaaaa showed [Qs Qd] and won (₮19.57) with One Pair
+Seat 3: bbbbbbbb folded before Flop (didn't bet)
+Seat 4: cccccccc folded before Flop (didn't bet)
+Seat 5: Hero showed [Ah Kd] and cashed out for ₮6 | Cash Out Fee ₮0.20
+Seat 6: dddddddd folded before Flop (didn't bet)
+"""
+
+
+class TestHandHistory(unittest.TestCase):
+
+    def test_parse_snippet(self):
+        (ph,) = parse_hands(SNIPPET)
+        self.assertEqual((ph.sb, ph.bb, ph.ante, ph.button_seat), (10, 10, 10, 3))
+        self.assertEqual(ph.hero_cards, ['Ah', 'Kd'])
+        self.assertEqual(sum(ph.invested().values()), ph.total_pot)
+        self.assertEqual(ph.net('Hero'), 600 - 1000)              # cash-out counts
+        self.assertEqual(ph.net('aaaaaaaa'), 1957 - 1000)
+        h, decisions = replay(ph, candidates=[make_bot('TAG')])
+        self.assertEqual(len(decisions), 1)                        # Hero's single decision
+        st, hero, picks = decisions[0]
+        self.assertEqual((st.position, st.to_call, hero.kind), ('BB', 50, RAISE))
+        self.assertEqual(sum(h.invested), 2060)
+
+    def test_round_trip(self):
+        bots = [make_bot(k, k, seed=i) for i, k in enumerate(
+            ['TAG', 'LAG', 'Nit', 'Station', 'Maniac', 'Scared', 'Nervous'])]
+        text, hist = generate(bots, 150, seed=11, straddle_rate=0.3)
+        hands = parse_hands(text)
+        self.assertEqual(len(hands), 150)
+        for ph, (h, order) in zip(hands, hist):
+            replay(ph)                                            # raises on any mismatch
+            self.assertEqual(sum(ph.invested().values()), sum(h.invested))
+            self.assertEqual(ph.rake, h.rake)
+            names = [ph.seats[i + 1][0] for i in order]
+            for j, nm in enumerate(names):
+                self.assertEqual(ph.net(nm), h.winnings[j])
+            self.assertEqual(sum(h.winnings), -h.rake)
+
+    def test_backtest_agrees_with_itself(self):
+        bots = [make_bot(k, k, seed=i) for i, k in enumerate(
+            ['TAG', 'Nervous', 'Scared', 'Station', 'Maniac', 'LAG', 'Nit'])]
+        text, _ = generate(bots, 200, seed=5, hero_index=0)
+        _, rows, _, skipped = backtest(parse_hands(text), ['TAG', 'Nit'])
+        self.assertEqual(skipped, [])
+        s = score(rows, 'TAG')
+        self.assertEqual(s['agree']['preflop'], s['total']['preflop'])   # deterministic preflop
+        n = score(rows, 'Nit')
+        self.assertLess(n['agree']['preflop'], n['total']['preflop'])
 
 
 if __name__ == '__main__':

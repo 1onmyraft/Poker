@@ -13,10 +13,14 @@ A headless, dependency-free no-limit hold'em simulator for tuning bots (no GUI, 
 - `sim/bots.py`: rule bots (TAG, LAG, Nit, Station, Maniac, plus three levels of low-skill "scared" bots: Nervous, Scared, Terrified) and `ExploitBot`, which models opponents from its own stats tracker using public information only.
 - `sim/match.py`: duplicate-dealing match runner reporting bb/100 with 95% confidence intervals.
 - `sim/experiments.py`: the standard experiment suite; see [`sim/RESULTS.md`](sim/RESULTS.md) for the latest numbers.
+- `sim/handhistory.py`: reads and writes hand histories in the `1onmyraftpoker` text format (7-max, antes, straddles, rake, cash-outs, run-it-twice) and replays them through the engine, checking every action matches.
+- `sim/generate.py`: writes simulated hands in that format; `sim/backtest.py`: asks each bot what it would do at every Hero decision in a history file and scores it (see [`sim/examples/`](sim/examples)).
 
 ```
 python -m sim.experiments              # full suite, ~5 min on 4 cores
 python -m sim.experiments --scale 0.1  # quick run
+python -m sim.generate --hands 500 --hero TAG --out hands.txt
+python -m sim.backtest hands.txt --out report.md
 python -m unittest tests.test_sim
 ```
 

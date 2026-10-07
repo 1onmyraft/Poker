@@ -126,7 +126,8 @@ class ParamBot(Bot):
             limpers = sum(a.kind == CALL for a in voluntary)
             rng = p.open * (p.steal_mult if st.position in LATE and not limpers else 1.0)
             if top <= rng:
-                return Action(RAISE, int(bb * (p.open_size + limpers)))
+                # size off the straddle when there is one
+                return Action(RAISE, int(max(bb, st.current_bet) * (p.open_size + limpers)))
             if top <= rng + p.limp:
                 return Action(CALL)
             return passive

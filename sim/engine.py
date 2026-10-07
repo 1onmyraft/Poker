@@ -30,8 +30,8 @@ def position_names(n):
             6: ['BTN', 'SB', 'BB', 'UTG', 'MP', 'CO']}
     if n in base:
         return base[n]
-    middle = ['UTG'] + ['UTG+%d' % i for i in range(1, n - 5)] + ['MP', 'HJ', 'CO']
-    return ['BTN', 'SB', 'BB'] + middle[-(n - 3):]
+    # 7-max: UTG MP HJ CO; 8: UTG UTG+1 MP HJ CO; 9: UTG UTG+1 UTG+2 MP HJ CO
+    return ['BTN', 'SB', 'BB', 'UTG'] + ['UTG+%d' % i for i in range(1, n - 6)] + ['MP', 'HJ', 'CO']
 
 
 @dataclass
@@ -66,6 +66,12 @@ class HandHistory:
     winnings: list = None                          # net chips per seat
     ev_winnings: list = None   # all-in EV net chips (set only when players were all-in before the river)
     saw_street: dict = field(default_factory=dict)  # street -> seats still in at its start
+    posts: list = field(default_factory=list)       # (seat, kind, amount): ante/sb/bb/auto_bb/straddle
+    returns: list = field(default_factory=list)     # (street, seat, amount) uncalled bets returned
+    start_stacks: list = None
+    invested: list = None      # total chips each seat put in (after returns)
+    rake: int = 0
+    pot_awards: list = field(default_factory=list)  # per pot (main first): [(seat, amount), ...]
 
 
 @dataclass
@@ -111,41 +117,73 @@ class Table:
     rotate the bot list between hands to move the button (the match runner does this).
     '''
 
-    def __init__(self, big_blind=2, small_blind=None, stack_bb=100):
+    def __init__(self, big_blind=2, small_blind=None, stack_bb=100, ante=0, rake=0.0, rake_cap=None):
+        '''
+        ante: posted by every player each hand (dead money)
+        rake: fraction of the pot taken by the house (only if a flop is dealt)
+        rake_cap: maximum rake per hand in chips (None = no cap)
+        '''
         self.bb = big_blind
         self.sb = small_blind if small_blind is not None else big_blind // 2
         self.start_stack = stack_bb * big_blind
+        self.ante = ante
+        self.rake = rake
+        self.rake_cap = rake_cap
 
-    def play_hand(self, bots, deck_seed, hand_id=0, stacks=None):
+    def play_hand(self, bots, deck_seed, hand_id=0, stacks=None, posts=None, deal=None):
+        '''
+        posts: extra live posts as (seat, amount, kind), kind 'straddle' or 'auto_bb'
+        deal:  known cards, {'hole': {seat: [c1, c2]}, 'board': [...]}; anything not
+               given is dealt from the seeded deck (used to replay real hand histories)
+        '''
         n = len(bots)
         assert 2 <= n <= 9
         deck = DECK[:]
         random.Random(deck_seed).shuffle(deck)
         positions = position_names(n)
         names = [b.name for b in bots]
-        # Cards are dealt by position so a given seed gives each seat the same cards
-        # no matter which bot sits there (needed for duplicate matches).
-        hole = [[deck[2 * i], deck[2 * i + 1]] for i in range(n)]
-        board_cards = deck[2 * n:2 * n + 5]
+        if deal:
+            known_hole = deal.get('hole', {})
+            known_board = list(deal.get('board', []))
+            used = {c for hc in known_hole.values() for c in hc} | set(known_board)
+            rest = [c for c in deck if c not in used]
+            hole = [list(known_hole[i]) if i in known_hole else [rest.pop(0), rest.pop(0)]
+                    for i in range(n)]
+            board_cards = known_board + rest[:5 - len(known_board)]
+            deck = [c for hc in hole for c in hc] + board_cards + rest[5 - len(known_board):]
+        else:
+            # Cards are dealt by position so a given seed gives each seat the same cards
+            # no matter which bot sits there (needed for duplicate matches).
+            hole = [[deck[2 * i], deck[2 * i + 1]] for i in range(n)]
+            board_cards = deck[2 * n:2 * n + 5]
 
         h = HandHistory(hand_id, names, positions, self.bb, hole)
         stacks = list(stacks) if stacks else [self.start_stack] * n
+        h.start_stacks = list(stacks)
         invested = [0] * n
         folded = [False] * n
 
-        def post(seat, amt):
+        def post(seat, amt, kind):
             amt = min(amt, stacks[seat])
             stacks[seat] -= amt
             invested[seat] += amt
+            h.posts.append((seat, kind, amt))
             return amt
 
+        if self.ante:
+            for i in range(n):
+                post(i, self.ante, 'ante')
         if n == 2:
             sb_seat, bb_seat, first_pre = 0, 1, 0
         else:
             sb_seat, bb_seat, first_pre = 1, 2, 3 % n
         street_bet = [0] * n
-        street_bet[sb_seat] = post(sb_seat, self.sb)
-        street_bet[bb_seat] = post(bb_seat, self.bb)
+        street_bet[sb_seat] = post(sb_seat, self.sb, 'sb')
+        street_bet[bb_seat] = post(bb_seat, self.bb, 'bb')
+        for seat, amt, kind in posts or []:
+            street_bet[seat] += post(seat, amt, kind)
+            if kind == 'straddle':
+                first_pre = (seat + 1) % n
 
         for b in bots:
             b.new_hand(hand_id)
@@ -170,11 +208,13 @@ class Table:
             first = first_pre if street == PREFLOP else 1
             agg = self._betting_round(bots, h, street, first, stacks, invested, street_bet,
                                       folded, pf_aggressor)
+            self._return_uncalled(h, street, stacks, invested, street_bet)
             if street == PREFLOP:
                 pf_aggressor = agg
             if sum(not f for f in folded) == 1:
                 break
 
+        h.invested = list(invested)
         h.winnings = self._settle(h, invested, folded)
         if h.showdown and allin_known is not None:
             h.ev_winnings = self._allin_ev(h, invested, folded, deck, allin_known, deck_seed)
@@ -185,7 +225,8 @@ class Table:
     def _betting_round(self, bots, h, street, first, stacks, invested, street_bet, folded, pf_agg):
         n = len(bots)
         current_bet = max(street_bet)
-        last_raise = self.bb  # minimum raise increment
+        # minimum raise increment (a straddle raises it preflop)
+        last_raise = max(self.bb, current_bet) if street == PREFLOP else self.bb
         # players who must still act; reopened to everyone else on a full raise
         needs = [i for i in range(n) if not folded[i] and stacks[i] > 0]
         can_raise = {i: True for i in needs}
@@ -216,7 +257,7 @@ class Table:
                 names=h.names, positions=h.positions, stacks=list(stacks),
                 street_actions=list(street_actions), history=list(h.actions),
                 preflop_aggressor=pf_agg, raises_this_street=raises)
-            act = self._sanitize(bots[seat].act(st), st)
+            act = self._sanitize(bots[seat].act(st), st, getattr(bots[seat], 'free_fold', False))
             pot_before = sum(invested)
 
             if act.kind == FOLD:
@@ -261,8 +302,9 @@ class Table:
         return aggressor
 
     @staticmethod
-    def _sanitize(act, st):
-        '''Coerce whatever a bot returns into a legal action.'''
+    def _sanitize(act, st, free_fold=False):
+        '''Coerce whatever a bot returns into a legal action (free_fold keeps a fold
+        when checking was possible, which real players occasionally do).'''
         if act is None:
             act = Action(CHECK if st.to_call == 0 else FOLD)
         kind = act.kind
@@ -272,7 +314,7 @@ class Table:
             else:
                 amount = max(st.min_raise_to, min(int(act.amount), st.max_raise_to))
                 return Action(RAISE if st.current_bet > 0 else BET, amount)
-        if kind == FOLD and st.to_call == 0:
+        if kind == FOLD and st.to_call == 0 and not free_fold:
             kind = CHECK
         if kind == CHECK and st.to_call > 0:
             kind = FOLD
@@ -280,15 +322,37 @@ class Table:
             kind = CHECK
         return Action(kind)
 
+    @staticmethod
+    def _return_uncalled(h, street, stacks, invested, street_bet):
+        top = max(street_bet)
+        if top == 0:
+            return
+        seat = street_bet.index(top)
+        second = max(b for i, b in enumerate(street_bet) if i != seat)
+        if top > second:
+            amt = top - second
+            stacks[seat] += amt
+            invested[seat] -= amt
+            street_bet[seat] -= amt
+            h.returns.append((street, seat, amt))
+
+    def _rake_for(self, total, flop_seen):
+        if not self.rake or not flop_seen:
+            return 0
+        r = int(total * self.rake + 0.5)
+        return min(r, self.rake_cap) if self.rake_cap is not None else r
+
     def _settle(self, h, invested, folded):
         n = len(invested)
         alive = [i for i in range(n) if not folded[i]]
+        h.rake = self._rake_for(sum(invested), bool(h.board))
         if len(alive) == 1:
             won = [0] * n
-            won[alive[0]] = sum(invested)
+            won[alive[0]] = sum(invested) - h.rake
+            h.pot_awards = [[(alive[0], sum(invested) - h.rake)]]
         else:
             h.showdown = alive
-            won = self._payout(h.hole, h.board, invested, alive)
+            won, h.pot_awards = self._payout(h.hole, h.board, invested, alive, h.rake)
         return [won[i] - invested[i] for i in range(n)]
 
     def _allin_ev(self, h, invested, folded, deck, known, seed, samples=300):
@@ -305,27 +369,43 @@ class Table:
             runouts = [rng.sample(rest, k) for _ in range(samples)]
         total = [0.0] * n
         for ro in runouts:
-            won = self._payout(h.hole, h.board[:known] + list(ro), invested, alive)
+            won, _ = self._payout(h.hole, h.board[:known] + list(ro), invested, alive, h.rake)
             for i in range(n):
                 total[i] += won[i]
         return [total[i] / len(runouts) - invested[i] for i in range(n)]
 
     @staticmethod
-    def _payout(hole, board, invested, alive):
+    def _payout(hole, board, invested, alive, rake=0):
+        '''Split main and side pots (rake taken proportionally). Returns (won, awards).'''
         n = len(invested)
         won = [0] * n
         values = {i: evaluate(hole[i] + board) for i in alive}
         levels = sorted(set(invested[i] for i in range(n) if invested[i] > 0))
-        prev = 0
+        pots, prev = [], 0
         for lvl in levels:
             pot = sum(min(invested[i], lvl) - min(invested[i], prev) for i in range(n))
             eligible = [i for i in alive if invested[i] >= lvl]
             if not eligible:  # only folded players put in this much; give it to the best remaining
                 eligible = [i for i in alive if invested[i] == max(invested[j] for j in alive)]
+            if pots and pots[-1][1] == eligible:
+                pots[-1][0] += pot          # same players eligible: same pot
+            else:
+                pots.append([pot, eligible])
+            prev = lvl
+        total = sum(p for p, _ in pots)
+        taken = 0
+        awards = []
+        for k, (pot, eligible) in enumerate(pots):
+            share_rake = rake - taken if k == len(pots) - 1 else int(rake * pot / total + 0.5)
+            taken += share_rake
+            pot -= share_rake
             best = max(values[i] for i in eligible)
             winners = [i for i in eligible if values[i] == best]
             share, odd = divmod(pot, len(winners))
-            for k, i in enumerate(sorted(winners, key=lambda s: (s - 1) % n)):
-                won[i] += share + (1 if k < odd else 0)
-            prev = lvl
-        return won
+            award = []
+            for j, i in enumerate(sorted(winners, key=lambda s: (s - 1) % n)):
+                amt = share + (1 if j < odd else 0)
+                won[i] += amt
+                award.append((i, amt))
+            awards.append(award)
+        return won, awards
