@@ -1,4 +1,5 @@
 import unittest
+from collections import Counter
 
 from sim.cards import evaluate, preflop_strength
 from sim.engine import Table, Action, FOLD, CHECK, CALL, BET, RAISE
@@ -8,6 +9,8 @@ from sim.strength import postflop_strength
 from sim.handhistory import parse_hands, replay, generate, write_hand
 from sim.backtest import backtest, score
 from sim.calibrate import target_from, distance
+from sim.bots import _wide_iso_hand, _value_iso_hand, ParamBot
+from sim.engine import position_names
 
 
 class Scripted(Bot):
@@ -243,6 +246,49 @@ class TestHandHistory(unittest.TestCase):
         self.assertEqual(s['agree']['preflop'], s['total']['preflop'])   # deterministic preflop
         n = score(rows, 'Nit')
         self.assertLess(n['agree']['preflop'], n['total']['preflop'])
+
+
+class TestAnteAndHunter(unittest.TestCase):
+
+    def test_position_names_7max(self):
+        self.assertEqual(position_names(7), ['BTN', 'SB', 'BB', 'UTG', 'MP', 'HJ', 'CO'])
+        self.assertEqual(position_names(9), ['BTN', 'SB', 'BB', 'UTG', 'UTG+1', 'UTG+2', 'MP', 'HJ', 'CO'])
+
+    def test_iso_hand_rules(self):
+        # wide: any ace, any king, any pair, two cards 7+
+        for hole in (['Ah', '2c'], ['Kd', '3s'], ['2h', '2d'], ['8c', '7d']):
+            self.assertTrue(_wide_iso_hand(hole), hole)
+        self.assertFalse(_wide_iso_hand(['Qh', '6c']))
+        # value (vs stations): aces, broadways, suited connectors, pairs - not K2o / T7o
+        for hole in (['Ah', '2c'], ['Qd', 'Js'], ['7h', '6h'], ['4c', '4d']):
+            self.assertTrue(_value_iso_hand(hole), hole)
+        for hole in (['Kd', '2s'], ['Tc', '7d']):
+            self.assertFalse(_value_iso_hand(hole), hole)
+
+    def test_antetag_opens_wider_on_button(self):
+        table = Table(big_blind=10, small_blind=10, ante=10)
+        opens = Counter()
+        for d in range(1500):
+            bots = [make_bot('AnteTAG', 'p%d' % i, seed=i) for i in range(7)]
+            h = table.play_hand(bots, deck_seed=d)
+            first = h.actions[0]
+            if first.kind == RAISE:
+                opens[h.positions[first.seat]] += 1
+        self.assertGreater(opens['UTG'], 100)                  # opens ~16% from UTG
+
+    def test_limp_fold_and_donk_stats(self):
+        # 3-handed: UTG(BTN seat 0 acts first) limps, SB raises, BTN folds
+        a = Scripted('a', [Action(CALL), Action(FOLD)])
+        b = Scripted('b', [Action(RAISE, 8)])
+        c = Scripted('c', [Action(FOLD)])
+        tr = StatsTracker()
+        tr.update(Table(big_blind=2).play_hand([a, b, c], deck_seed=1))
+        self.assertEqual((tr.get('a').stats['limp_fold'].count, tr.get('a').stats['limp_fold'].opp), (1, 1))
+        # heads-up: BTN raises, BB calls then leads the flop = donk
+        btn = Scripted('btn', [Action(RAISE, 6), Action(CALL)])
+        bb = Scripted('bb', [Action(CALL), Action(BET, 4)])
+        tr.update(Table(big_blind=2).play_hand([btn, bb], deck_seed=2))
+        self.assertEqual((tr.get('bb').stats['donk'].count, tr.get('bb').stats['donk'].opp), (1, 1))
 
 
 class TestCalibrate(unittest.TestCase):

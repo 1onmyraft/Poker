@@ -11,9 +11,14 @@ from dataclasses import dataclass, replace
 
 from .engine import Action, PREFLOP, FLOP, FOLD, CHECK, CALL, BET, RAISE
 from .stats import StatsTracker
+from .cards import RANK_VALUE
 from .strength import preflop_strength, postflop_strength
 
 LATE = ('CO', 'BTN', 'SB')
+BLINDS = ('SB', 'BB')
+# 0 = first to act, 1 = button (used by pos_spread)
+POS_RANK = {'UTG': 0.0, 'UTG+1': 0.1, 'UTG+2': 0.2, 'MP': 0.35, 'HJ': 0.55, 'CO': 0.75,
+            'BTN': 1.0, 'SB': 0.8, 'BB': 0.0}
 
 
 @dataclass(frozen=True)
@@ -28,6 +33,9 @@ class Params:
     call_3bet: float = 0.07
     fourbet: float = 0.025
     open_size: float = 2.5     # in big blinds
+    pos_spread: float = 0.0    # widen opens toward the button: open * (1 + pos_spread * rank)
+    iso: float = 1.0           # multiplier on the open range when raising over limpers in position
+    iso_per_limper: float = 1.0  # extra big blinds added to the raise per limper
     # postflop
     value: float = 0.66        # strength needed to bet for value
     bluff: float = 0.12        # chance to bet a weak hand when checked to
@@ -73,6 +81,15 @@ PRESETS = {
                         raise_bluff=0.0, bet_size=0.33),
 }
 SCARED_LEVELS = ['Nervous', 'Scared', 'Terrified']
+
+# Ante-aware baseline for ante == big blind games (9bb of dead money at 7-max):
+# wider positional opens, bigger opens and isolation raises, no limping,
+# pot-odds blind defence, more 3-bets, smaller c-bets to pick up dead money.
+PRESETS['AnteTAG'] = Params(
+    open=0.16, pos_spread=1.6, steal_mult=1.25, limp=0.0, call_open=0.12, bb_defend=3.5,
+    threebet=0.08, call_3bet=0.12, fourbet=0.04, open_size=3.0, iso=1.6, iso_per_limper=1.5,
+    value=0.62, bluff=0.10, cbet=0.60, semibluff=0.5, call_margin=0.10, fear=0.0,
+    raise_value=0.84, raise_bluff=0.03, bet_size=0.55)
 
 
 class Bot:
@@ -124,10 +141,15 @@ class ParamBot(Bot):
 
         if r == 1:
             limpers = sum(a.kind == CALL for a in voluntary)
-            rng = p.open * (p.steal_mult if st.position in LATE and not limpers else 1.0)
+            rng = p.open * (1 + p.pos_spread * POS_RANK.get(st.position, 0.0))
+            if limpers:
+                rng *= p.iso if st.position not in BLINDS else 1.0
+            elif st.position in LATE:
+                rng *= p.steal_mult
             if top <= rng:
                 # size off the straddle when there is one
-                return Action(RAISE, int(max(bb, st.current_bet) * (p.open_size + limpers)))
+                unit = max(bb, st.current_bet)
+                return Action(RAISE, int(unit * (p.open_size + p.iso_per_limper * limpers)))
             if top <= rng + p.limp:
                 return Action(CALL)
             return passive
@@ -353,6 +375,139 @@ def make_bot(kind, name=None, seed=0):
         return ExploitBot(name, seed=seed)
     if kind == 'ExploitPool':
         return ExploitBot(name, seed=seed, pool_mode=True)
+    if kind == 'Hunter':
+        return Hunter(name, seed=seed)
+    if kind == 'HunterPool':
+        return Hunter(name, seed=seed, pool_mode=True)
     if kind.startswith('Exploit-'):
         return ExploitBot(name, seed=seed, disabled=kind.split('-')[1:])
     return ParamBot(name, PRESETS[kind], seed=seed)
+
+
+# ------------------------------------------------------------------------------ Hunter
+
+def _wide_iso_hand(hole):
+    '''"Any king, any ace, any two cards 7 or higher, and any pair" (Wilcox).'''
+    r = sorted((RANK_VALUE[c[0]] for c in hole), reverse=True)
+    return r[0] == r[1] or r[0] >= 13 or r[1] >= 7
+
+
+def _value_iso_hand(hole):
+    '''Against stations: "all aces, suited connectors and broadway hands" (plus pairs).'''
+    r = sorted((RANK_VALUE[c[0]] for c in hole), reverse=True)
+    suited = hole[0][1] == hole[1][1]
+    return r[0] == r[1] or r[0] == 14 or r[1] >= 10 or (suited and r[0] - r[1] <= 2 and r[1] >= 4)
+
+
+class Hunter(ExploitBot):
+    '''
+    Ante-aware baseline plus the "winning money from bad players" adjustments
+    (Jack Wilcox, ThePokerBank), driven by the stats it collects:
+
+    - Isolate limpers in position with a big raise. Against players who limp/fold
+      or fold to c-bets, raise a wide range; against stations, only hands that make
+      strong pairs/draws.
+    - C-bet half pot with anything against players who fold to c-bets (>= 50%);
+      against stations (fold to c-bet <= 30%) c-bet only made hands and give up otherwise.
+    - After a flop c-bet is called, double-barrel only top pair or better.
+    - Value bet stations three streets (2/3 pot), and thinly on the river (1/2 pot)
+      when their WTSD is 35%+; with no read, check marginal rivers.
+    - Passive players' check-raises are strong: fold all but overpair+.
+    - Passive players' donk bets and tiny "blocking" bets are weak: raise / call wider.
+    '''
+
+    def __init__(self, name, params=None, seed=0, pool_mode=False):
+        super().__init__(name, params or PRESETS['AnteTAG'], seed=seed, pool_mode=pool_mode)
+
+    # keep the baseline sizing and params; reads are applied in act()
+    def params_for(self, st):
+        return self.p
+
+    def bluff_size(self, st, p):
+        return p.bet_size
+
+    def value_size(self, st, p):
+        return p.bet_size
+
+    def _read(self, o):
+        '''Classify an opponent: 'folder', 'station' or None (no clear read).'''
+        fcb = o.rate('fold_cbet', k=10)
+        lf = o.rate('limp_fold', k=10)
+        wtsd = o.rate('wtsd', k=15)
+        if fcb <= 0.30 or (wtsd >= 0.38 and fcb < 0.5):
+            return 'station'
+        if fcb >= 0.50 or lf >= 0.55:
+            return 'folder'
+        return None
+
+    def _preflop(self, st, p):
+        voluntary = [a for a in st.street_actions if a.kind in (CALL, RAISE)]
+        limpers = [a.seat for a in voluntary if a.kind == CALL]
+        if (st.raises_this_street == 1 and limpers and st.position not in BLINDS
+                and not any(a.kind == RAISE for a in voluntary)):
+            reads = {self._read(self._opp(st, i)) for i in limpers}
+            base = super()._preflop(st, p)
+            if base.kind == RAISE:
+                return base
+            if 'station' in reads:
+                ok = _value_iso_hand(st.hole)
+            elif reads == {'folder'}:
+                ok = _wide_iso_hand(st.hole)
+            else:
+                ok = False
+            if ok:
+                unit = max(st.big_blind, st.current_bet)
+                return Action(RAISE, int(unit * (p.open_size + p.iso_per_limper * len(limpers))))
+            return base
+        return super()._preflop(st, p)
+
+    def _postflop(self, st, p):
+        others = [i for i in st.active_seats if i != st.seat]
+        if len(others) != 1:
+            return super()._postflop(st, p)
+        opp = self._opp(st, others[0])
+        read = self._read(opp)
+        passive = opp.rate('afq', k=20) < 0.30
+        s = postflop_strength(st.hole, st.board)
+        pot = st.pot
+        is_pfa = st.preflop_aggressor == st.seat
+        prev = {FLOP: PREFLOP, 'turn': FLOP, 'river': 'turn'}[st.street]
+        barreling = st.street != FLOP and self._we_bet_and_got_called(st, prev)
+
+        if st.to_call == 0:
+            if st.street == FLOP and is_pfa:
+                if read == 'folder':
+                    return self._bet(st, 0.5)                      # needs ~33% folds, they fold 50%+
+                if read == 'station':
+                    return self._bet(st, 0.66) if s >= p.value else Action(CHECK)
+            if barreling:
+                if read == 'station' and s >= 0.60:
+                    return self._bet(st, 0.66)                     # value them three streets
+                if st.street == 'river' and s >= 0.55 and opp.rate('wtsd', k=15) >= 0.35:
+                    return self._bet(st, 0.5)                      # thin value vs showdown-happy
+                return self._bet(st, 0.55) if s >= 0.66 else Action(CHECK)   # top pair+ only
+            if read == 'station' and s < p.value:
+                return Action(CHECK)                               # no bluffs into stations
+            return super()._postflop(st, p)
+
+        bettor_raised_us = any(a.seat == st.seat and a.kind in (BET, RAISE) for a in st.street_actions)
+        bet_frac = st.to_call / max(1, pot - st.to_call)
+        if bettor_raised_us and passive:
+            return Action(CALL) if s >= 0.80 else Action(FOLD)     # passive check-raise = strong
+        if st.street == FLOP and is_pfa and passive and not bettor_raised_us:
+            # donk bet from a passive player: draws and weak pairs
+            if st.can_raise and s >= 0.55:
+                return Action(RAISE, int(st.current_bet * 3))
+        if passive and bet_frac <= 0.35:
+            # small "blocking" bet = weak showdown value
+            if st.can_raise and s >= 0.72:
+                return Action(RAISE, int(st.current_bet * 3 + (pot - st.current_bet) * 0.5))
+            return Action(CALL) if s >= st.to_call / (pot + st.to_call) + p.call_margin - 0.08 \
+                else super()._postflop(st, p)
+        return super()._postflop(st, p)
+
+    @staticmethod
+    def _we_bet_and_got_called(st, street):
+        acts = [a for a in st.history if a.street == street]
+        ours = [k for k, a in enumerate(acts) if a.seat == st.seat and a.kind in (BET, RAISE)]
+        return bool(ours) and any(a.kind == CALL for a in acts[ours[-1] + 1:])

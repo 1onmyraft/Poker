@@ -22,12 +22,14 @@ STAT_INFO = {
     'vpip':      ('VPIP',    0.25, 'voluntarily put chips in preflop'),
     'pfr':       ('PFR',     0.18, 'raised preflop'),
     'limp':      ('Limp',    0.10, 'called the big blind when first in or behind limpers'),
+    'limp_fold': ('LmpF',    0.50, 'limped, then folded to a raise'),
     'three_bet': ('3Bet',    0.07, 're-raised a single raise preflop'),
     'fold_3bet': ('F3B',     0.55, 'opened, then folded to a 3-bet'),
     'steal':     ('Steal',   0.35, 'opened from CO/BTN/SB when folded to'),
     'fold_steal': ('FtS',    0.65, 'folded a blind to a steal'),
     'cbet':      ('CBet',    0.60, 'preflop raiser bet the flop when checked to'),
     'fold_cbet': ('FCB',     0.45, 'folded to a flop c-bet'),
+    'donk':      ('Donk',    0.10, 'led into the preflop raiser on the flop'),
     'fvb':       ('FvB',     0.45, 'folded when facing a postflop bet/raise'),
     'fvb_small': ('FvB<½',   0.40, 'folded facing a postflop bet under half pot'),
     'fvb_big':   ('FvB≥½',   0.50, 'folded facing a postflop bet of half pot or more'),
@@ -129,6 +131,7 @@ class StatsTracker:
         callers_after_open = 0
         seen = defaultdict(set)   # seat -> which opportunity types already counted
         vpip, pfr = set(), set()
+        limpers = set()
 
         for e in (a for a in h.actions if a.street == PREFLOP):
             i, pos, st = e.seat, h.positions[e.seat], ps[e.seat].stats
@@ -140,6 +143,8 @@ class StatsTracker:
             if raises == 1 and pos != 'BB' and 'open' not in seen[i]:
                 seen[i].add('open')
                 st['limp'].add(e.kind == CALL)
+                if e.kind == CALL:
+                    limpers.add(i)
                 if not voluntary and pos in STEAL_POSITIONS:
                     st['steal'].add(e.kind == RAISE)
             if raises == 2 and i != opener and 'three_bet' not in seen[i]:
@@ -148,6 +153,9 @@ class StatsTracker:
                 if (pos in BLIND_POSITIONS and i not in voluntary and callers_after_open == 0
                         and h.positions[opener] in STEAL_POSITIONS and h.positions[opener] != pos):
                     st['fold_steal'].add(e.kind == FOLD)
+            if raises >= 2 and i in limpers and 'limp_fold' not in seen[i]:
+                seen[i].add('limp_fold')
+                st['limp_fold'].add(e.kind == FOLD)
             if raises == 3 and i == opener and 'fold_3bet' not in seen[i]:
                 seen[i].add('fold_3bet')
                 st['fold_3bet'].add(e.kind == FOLD)
@@ -172,6 +180,7 @@ class StatsTracker:
         bet_open = False
         first_bettor = None
         bet_count = 0
+        donk_seen = set()
         faced = set()
         checked = set()
         cbet_counted = False
@@ -182,6 +191,12 @@ class StatsTracker:
             elif e.kind == CALL:
                 ps[i].post_calls += 1
             st['afq'].add(e.kind in (BET, RAISE))
+
+            if (street == FLOP and pfa is not None and i != pfa and not bet_open
+                    and pfa in h.saw_street.get(FLOP, []) and i not in donk_seen
+                    and not any(a.seat == pfa for a in acts[:acts.index(e)])):
+                donk_seen.add(i)
+                st['donk'].add(e.kind == BET)
 
             if street == FLOP and i == pfa and not bet_open and not cbet_counted:
                 cbet_counted = True
