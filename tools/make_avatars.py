@@ -199,6 +199,19 @@ def tag():
     finish(img, 'TAG')
 
 
+def wizard():
+    img, d = canvas((49, 27, 146))
+    face(d, cy=44, r=16)
+    d.polygon(sc(36, 36, 52, 67, 20, 67), fill=(245, 245, 245))                        # beard
+    d.polygon(sc(17, 33, 55, 33, 40, 4), fill=(30, 136, 229), outline=INK)              # hat
+    d.rectangle(sc(14, 30, 58, 35), fill=(21, 101, 192))
+    for x, y in ((33, 18), (41, 25), (37, 11)):                                         # stars
+        d.polygon(sc(x, y - 3, x + 1, y - 1, x + 3, y, x + 1, y + 1, x, y + 3, x - 1, y + 1, x - 3, y, x - 1, y - 1),
+                  fill=(255, 235, 59))
+    eyes(d, y=42, dx=6, r=2.2)
+    finish(img, 'Wizard')
+
+
 def exploit():
     img, d = canvas((40, 53, 147))
     face(d)
@@ -211,6 +224,6 @@ def exploit():
 
 if __name__ == '__main__':
     os.makedirs(OUT, exist_ok=True)
-    for fn in (you, hunter, antemax, maniac, antetag, station, nervous, scared, terrified, nit, lag, tag, exploit):
+    for fn in (you, wizard, hunter, antemax, maniac, antetag, station, nervous, scared, terrified, nit, lag, tag, exploit):
         fn()
     print('wrote avatars to', OUT)

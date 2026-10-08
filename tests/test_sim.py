@@ -351,6 +351,77 @@ class TestPngFallback(unittest.TestCase):
         self.assertEqual(decode_png(os.path.join(here, 'resources', 'table.png'))[:2], (800, 412))
 
 
+class TestRanges(unittest.TestCase):
+
+    def test_card_removal_three_aces(self):
+        # three aces on the flop and an ace in our hand: nobody else can hold an ace
+        from sim.ranges import Range, COMBOS
+        r = Range().remove(['Ah', 'As', 'Ad', 'Ac', 'Kd'])
+        self.assertEqual(sum(1 for c, w in zip(COMBOS, r.w) if w > 0 and 'A' in (c[0][0], c[1][0])), 0)
+        self.assertEqual(sum(1 for w in r.w if w > 0), 1081)       # C(47, 2)
+
+    def test_equity_known_matchups(self):
+        import random
+        from sim.ranges import Range, COMBOS, equity
+        kk = Range([1.0 if x[0][0] == x[1][0] == 'K' else 0.0 for x in COMBOS])
+        self.assertAlmostEqual(equity(['Ah', 'As'], [], [kk], 1500, random.Random(1)), 0.82, delta=0.04)
+        # made nut flush on the river vs anything: wins unless the board pairs into more
+        self.assertGreater(equity(['Ah', 'Kh'], ['2h', '7h', '9h', 'Js', '3c'], [Range()], 300,
+                                  random.Random(2)), 0.97)
+
+    def test_tracker_narrows_ranges(self):
+        from sim.ranges import RangeTracker
+        from sim.engine import DecisionState, ActionEvent
+
+        def state(pos, history, board=()):
+            return DecisionState(hand_id=1, street='flop' if board else 'preflop', seat=0, position='BB',
+                                 hole=['2c', '3d'], board=list(board), pot=100, to_call=0, stack=900,
+                                 committed=0, current_bet=0, min_raise_to=10, max_raise_to=900,
+                                 can_raise=True, big_blind=10, n_active=2, active_seats=[0, 1],
+                                 names=['me', 'v'], positions=['BB', pos], stacks=[900, 900],
+                                 street_actions=[], history=history, preflop_aggressor=1,
+                                 raises_this_street=0)
+        raise_ev = ActionEvent('preflop', 1, 'raise', 30, 30, 10, 20)
+        tr = RangeTracker()
+        utg = tr.range_for(state('UTG', [raise_ev]), 1, [])
+        btn = tr.range_for(state('BTN', [raise_ev]), 1, [])
+        self.assertLess(utg.total(), btn.total())                  # UTG opens tighter
+        board = ['Ks', '7d', '2h']
+        bet = ActionEvent('flop', 1, 'bet', 60, 60, 0, 90)
+        before = tr.range_for(state('BTN', [raise_ev], board), 1, ['2c', '3d'])
+        after = tr.range_for(state('BTN', [raise_ev, bet], board), 1, ['2c', '3d'])
+        share = lambda r: sum(w for c, w in zip(__import__('sim.ranges').ranges.COMBOS, r.w)
+                              if 'K' in (c[0][0], c[1][0])) / r.total()
+        self.assertGreater(share(after), share(before))           # betting a K-high board: more kings
+
+
+class TestPushFold(unittest.TestCase):
+
+    def test_heads_up_nash_matches_published(self):
+        import json
+        import os
+        from sim import pushfold
+        from sim.cards import PF_ORDER
+        if not pushfold.available():
+            self.skipTest('resources/pushfold.json not built')
+        d = json.load(open(pushfold.PATH))
+        n = {k: (6 if len(k) == 2 else (4 if k[2] == 's' else 12)) for k in PF_ORDER}
+        pct = lambda hexmask: 100 * sum(n[k] for k in pushfold._hand_set(hexmask)) / 1326
+        c = d['charts']['classic/2/10']
+        self.assertAlmostEqual(pct(c['push']['BTN']), 58, delta=4)       # published HU Nash ~58%
+        self.assertAlmostEqual(pct(c['call']['BB<BTN']), 37, delta=4)    # and ~37%
+        self.assertTrue(os.path.getsize(pushfold.PATH) < 2_000_000)
+
+    def test_wizard_plays_short_and_deep(self):
+        table = Table(big_blind=10, small_blind=10, ante=10)
+        bots = [make_bot('Wizard', 'w%d' % i, seed=i) for i in range(3)] + \
+               [make_bot(k, k) for k in ('Station', 'Maniac', 'Nervous', 'Hunter')]
+        for d in range(25):
+            stacks = [80 + 40 * ((d + i) % 5) for i in range(7)] if d % 2 else None   # 8-24bb or 100bb
+            h = table.play_hand(bots, deck_seed=d, hand_id=d, stacks=stacks)
+            self.assertEqual(sum(h.winnings), 0)
+
+
 class TestCalibrate(unittest.TestCase):
 
     def test_distance_is_zero_on_itself_and_grows(self):

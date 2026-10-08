@@ -10,6 +10,8 @@ import random
 from dataclasses import dataclass, replace
 
 from .engine import Action, PREFLOP, FLOP, FOLD, CHECK, CALL, BET, RAISE
+from . import pushfold
+from .ranges import RangeTracker, equity
 from .stats import StatsTracker
 from .cards import RANK_VALUE
 from .strength import preflop_strength, postflop_strength
@@ -46,6 +48,10 @@ class Params:
     raise_value: float = 0.85  # strength needed to raise a bet
     raise_bluff: float = 0.03  # chance to bluff-raise
     bet_size: float = 0.66     # fraction of pot
+    # "smart" mode: push/fold equilibrium charts when short, and postflop equity against
+    # each opponent's estimated range (with card removal) instead of the strength heuristic
+    smart: bool = False
+    eq_samples: int = 200
 
 
 PRESETS = {
@@ -90,6 +96,13 @@ PRESETS['AnteTAG'] = Params(
     threebet=0.08, call_3bet=0.12, fourbet=0.04, open_size=3.0, iso=1.6, iso_per_limper=1.5,
     value=0.62, bluff=0.10, cbet=0.60, semibluff=0.5, call_margin=0.10, fear=0.0,
     raise_value=0.84, raise_bluff=0.03, bet_size=0.55)
+
+# Wizard: AnteTAG plus "smart" mode - solved push/fold charts when short, and every
+# postflop decision made on equity against each opponent's estimated range, with card
+# removal (it knows nobody else can hold the cards it can see). Thresholds are lower
+# than AnteTAG's because real equity against a range runs below the old heuristic.
+PRESETS['Wizard'] = replace(PRESETS['AnteTAG'], smart=True, value=0.58, call_margin=0.03,
+                            raise_value=0.80, semibluff=0.5, bluff=0.10)
 
 # AnteTAG's parameters tuned for win rate by sim/tune.py against the rule-bot zoo
 # (fish, passive and regs tables). It became a preflop maniac (VPIP ~74, PFR ~59,
@@ -136,6 +149,21 @@ class ParamBot(Bot):
     def value_size(self, st, p):
         return p.bet_size
 
+    def strength(self, st, p):
+        '''(strength, multiway-adjusted strength) for postflop decisions.'''
+        if p.smart:
+            if getattr(self, '_ranges', None) is None:
+                self._ranges = RangeTracker(getattr(self, 'tracker', None))
+            dead = list(st.hole) + list(st.board)
+            opp = [self._ranges.range_for(st, i, dead) for i in st.active_seats if i != st.seat]
+            eq = equity(st.hole, st.board, opp, samples=p.eq_samples, rng=self.rng)
+            n = max(1, len(opp))
+            s = eq ** (1.0 / n) if n > 1 else eq      # heads-up equivalent, so thresholds still apply
+            self.last_equity = eq
+            return s, s
+        s = postflop_strength(st.hole, st.board)
+        return s, s - 0.06 * (st.n_active - 2)      # be more careful multiway
+
     def act(self, st):
         p = self.params_for(st)
         if st.street == PREFLOP:
@@ -149,6 +177,17 @@ class ParamBot(Bot):
         r = st.raises_this_street
         voluntary = [a for a in st.street_actions if a.kind in (CALL, RAISE)]
         passive = Action(CHECK) if st.to_call == 0 else Action(FOLD)
+
+        if p.smart:
+            # short stacks: solved push/fold charts
+            if r == 1 and not voluntary and pushfold.effective_stack(st) <= 15 * bb:
+                shove = pushfold.first_in_shove(st)
+                if shove is not None:
+                    return Action(RAISE, st.max_raise_to) if shove else passive
+            if r == 2 and pushfold.effective_stack(st) <= 25 * bb:
+                call = pushfold.call_shove(st)
+                if call is not None:
+                    return Action(CALL) if call else passive
 
         if r == 1:
             limpers = sum(a.kind == CALL for a in voluntary)
@@ -189,8 +228,7 @@ class ParamBot(Bot):
 
     # --------------------------------------------------------------- postflop
     def _postflop(self, st, p):
-        s = postflop_strength(st.hole, st.board)
-        s_adj = s - 0.06 * (st.n_active - 2)      # be more careful multiway
+        s, s_adj = self.strength(st, p)
         pot = st.pot
         is_pfa = st.preflop_aggressor == st.seat
 
@@ -430,7 +468,7 @@ class Hunter(ExploitBot):
     '''
 
     def __init__(self, name, params=None, seed=0, pool_mode=False):
-        super().__init__(name, params or PRESETS['AnteTAG'], seed=seed, pool_mode=pool_mode)
+        super().__init__(name, params or PRESETS['Wizard'], seed=seed, pool_mode=pool_mode)
 
     # keep the baseline sizing and params; reads are applied in act()
     def params_for(self, st):
@@ -481,7 +519,7 @@ class Hunter(ExploitBot):
         opp = self._opp(st, others[0])
         read = self._read(opp)
         passive = opp.rate('afq', k=20) < 0.30
-        s = postflop_strength(st.hole, st.board)
+        s, _ = self.strength(st, p)
         pot = st.pot
         is_pfa = st.preflop_aggressor == st.seat
         prev = {FLOP: PREFLOP, 'turn': FLOP, 'river': 'turn'}[st.street]

@@ -22,10 +22,10 @@ STRUCTURES = {
     'ante': dict(small_blind=10, big_blind=10, ante=10, label='Ante game: 10/10 + 10 ante (like the sample)'),
     'classic': dict(small_blind=5, big_blind=10, ante=0, label='Classic: 5/10, no ante'),
 }
-BOT_CHOICES = ['Hunter', 'AnteMax', 'Maniac', 'AnteTAG', 'Station', 'Nervous', 'Scared',
+BOT_CHOICES = ['Wizard', 'Hunter', 'AnteMax', 'Maniac', 'AnteTAG', 'Station', 'Nervous', 'Scared',
                'Terrified', 'Nit', 'LAG', 'TAG', 'Exploit']
 FISH = {'Station', 'Nervous', 'Scared', 'Terrified'}
-DEFAULT_LINEUP = ['Hunter', 'AnteMax', 'Maniac', 'AnteTAG', 'Station', 'Nervous']
+DEFAULT_LINEUP = ['Wizard', 'Hunter', 'AnteMax', 'Maniac', 'Station', 'Nervous']
 
 
 @dataclass

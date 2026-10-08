@@ -13,6 +13,7 @@ Options: --draw-cards (draw cards as shapes), --selftest, --diagnose.
 '''
 import math
 import os
+import random
 import struct
 import sys
 import tkinter as tk
@@ -25,6 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from sim.cards import describe, best_five, hand_code, evaluate, PF_PERCENTILE   # noqa: E402
 from sim.engine import Action, FOLD, CHECK, CALL, BET, RAISE        # noqa: E402
 from sim.session import Session, STRUCTURES, BOT_CHOICES, DEFAULT_LINEUP  # noqa: E402
+from sim.ranges import RangeTracker, equity                         # noqa: E402
 from sim.strength import _draws                                     # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -37,12 +39,13 @@ FELT = ROOM
 TABLE_FELT_RGB = (0x1a, 0xbc, 0x9c)
 BASE_PAUSE = 850                 # ms a bot's action stays on screen at Normal speed
 SPEEDS = {'Slow': 1.6, 'Normal': 1.0, 'Fast': 0.45, 'Instant': 0.0}
-AVATARS = ['You', 'Hunter', 'AnteMax', 'Maniac', 'AnteTAG', 'Station', 'Nervous', 'Scared',
+AVATARS = ['You', 'Wizard', 'Hunter', 'AnteMax', 'Maniac', 'AnteTAG', 'Station', 'Nervous', 'Scared',
            'Terrified', 'Nit', 'LAG', 'TAG', 'Exploit']
 CARD_WORD = {'A': 'Ace', 'K': 'King', 'Q': 'Queen', 'J': 'Jack', 'T': 'Ten', '9': 'Nine', '8': 'Eight',
              '7': 'Seven', '6': 'Six', '5': 'Five', '4': 'Four', '3': 'Three', '2': 'Two'}
 BOT_INFO = {
-    'Hunter': 'ante-aware TAG that reads opponents (isolates limpers, c-bets folders, value-bets stations)',
+    'Wizard': 'thinks in ranges: knows what you could hold (card removal), equity-based decisions, solved short-stack shoves',
+    'Hunter': 'Wizard + reads: isolates limpers, c-bets folders, value-bets stations',
     'AnteMax': 'hyper-aggressive preflop (VPIP ~74 / PFR ~59), gives up postflop',
     'Maniac': 'raises and bluffs constantly',
     'AnteTAG': 'solid ante-aware tight-aggressive baseline',
@@ -267,6 +270,7 @@ class PokerApp:
         self.hero_turn = False
         self.cur = None
         self.disp = None
+        self.range_tracker = None
         self.choice = tk.StringVar()
         self.pause_var = tk.IntVar()
         self.speed = tk.StringVar(value='Normal')
@@ -767,11 +771,34 @@ class PokerApp:
                 extra = [n for n, f in (('flush draw', fd), ('open-ended straight draw', oe), ('gutshot', gs)) if f]
                 if extra:
                     what += ' + ' + ' + '.join(extra)
+        eq = self.hero_equity(st)
+        if eq is not None:
+            what += ' — you win %d%% vs their likely hands' % round(100 * eq)
         if st.to_call:
             need = 100.0 * st.to_call / (st.pot + st.to_call)
-            return ('Your turn: %s to call into a %s pot (calling needs to win %d%% of the time). %s.' %
+            return ('Your turn: %s to call into a %s pot (calling needs %d%%). %s.' %
                     (money(st.to_call), money(st.pot), round(need), what))
         return 'Your turn: nobody has bet — check or bet. Pot %s. %s.' % (money(st.pot), what)
+
+    def hero_equity(self, st):
+        '''Your chance to win against what the others could hold, using the same range model
+        as the Wizard bot (their actions, their stats, and card removal for every card you
+        can see). Preflop it only counts players who have put money in voluntarily.'''
+        try:
+            if self.range_tracker is None or self.range_tracker.stats is not self.session.tracker:
+                self.range_tracker = RangeTracker(self.session.tracker)
+            dead = list(st.hole) + list(st.board)
+            if st.board:
+                opp = [i for i in st.active_seats if i != st.seat]
+            else:
+                opp = sorted({a.seat for a in st.history if a.kind in (CALL, RAISE) and a.seat != st.seat}
+                             & set(st.active_seats))
+            if not opp:
+                return None
+            ranges = [self.range_tracker.range_for(st, i, dead) for i in opp]
+            return equity(st.hole, st.board, ranges, samples=400, rng=random.Random(st.hand_id))
+        except Exception:            # never let a hint break the game
+            return None
 
     # ============================================================ animation
     def k(self):
