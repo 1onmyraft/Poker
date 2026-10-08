@@ -338,10 +338,17 @@ class PokerApp:
         self.canvas.pack(padx=10, pady=(6, 0))
         self.canvas.bind('<Button-1>', lambda e: self.root.focus_set())
 
-        # plain-English "what's happening" bar
-        self.status = tk.Label(self.root, text='', bg='#10372b', fg='white', font=('Helvetica', 15, 'bold'),
-                               anchor='w', padx=14, pady=6, wraplength=W - 20, justify='left')
-        self.status.pack(fill='x', padx=10, pady=(4, 0))
+        # plain-English "what's happening" bar. Fixed height: if it grew with its text the whole
+        # window would re-layout, which flashes black on macOS's Tk 8.5.
+        bar = tk.Frame(self.root, bg='#10372b', height=60)
+        bar.pack(fill='x', padx=10, pady=(4, 0))
+        bar.pack_propagate(False)
+        self.status = tk.Label(bar, text='', bg='#10372b', fg='white', font=('Helvetica', 14, 'bold'),
+                               anchor='w', padx=14, wraplength=W - 30, justify='left')
+        self.status.pack(fill='both', expand=True)
+        self.status_bar = bar
+        self.hover_seat = None
+        self.hover_job = None
         self.status_text = ''
 
         ctl = tk.Frame(self.root, bg=ROOM)
@@ -434,7 +441,31 @@ class PokerApp:
 
     def say(self, text, colour='white', bg='#10372b'):
         self.status_text = text
-        self.status.configure(text=text, fg=colour, bg=bg)
+        self.status_colours = (colour, bg)
+        if self.hover_seat is None:
+            self.status.configure(text=text, fg=colour, bg=bg)
+            self.status_bar.configure(bg=bg)
+
+    def hover_enter(self, t):
+        # a seat is several canvas items; moving between them fires leave+enter, so debounce
+        if self.hover_job:
+            self.root.after_cancel(self.hover_job)
+            self.hover_job = None
+        if self.hover_seat != t:
+            self.hover_seat = t
+            self.explain_seat(t)
+
+    def hover_leave(self):
+        if self.hover_job:
+            self.root.after_cancel(self.hover_job)
+        self.hover_job = self.root.after(150, self.hover_restore)
+
+    def hover_restore(self):
+        self.hover_job = None
+        self.hover_seat = None
+        colour, bg = getattr(self, 'status_colours', ('white', '#10372b'))
+        self.status.configure(text=self.status_text, fg=colour, bg=bg)
+        self.status_bar.configure(bg=bg)
 
     # ========================================================= setup dialog
     def setup_dialog(self):
@@ -645,8 +676,8 @@ class PokerApp:
             bx, by = self.bet_spot(t)
             self.draw_chips(bx - 14, by, bet)
             c.create_text(bx + 2, by, text=money(bet), anchor='w', fill='white', font=('Helvetica', 12, 'bold'))
-        c.tag_bind(tag, '<Enter>', lambda e, t=t: self.explain_seat(t))
-        c.tag_bind(tag, '<Leave>', lambda e: self.status.configure(text=self.status_text))
+        c.tag_bind(tag, '<Enter>', lambda e, t=t: self.hover_enter(t))
+        c.tag_bind(tag, '<Leave>', lambda e: self.hover_leave())
 
     def avatar_kind(self, seat):
         return 'You' if seat.is_human else (seat.kind if seat.kind in AVATARS else 'TAG')
@@ -711,14 +742,14 @@ class PokerApp:
             style = BOT_INFO.get(seat.kind, '')
             if p and p.hands:
                 pct = lambda k: '%d%%' % round(100 * p.rate(k, shrink=False)) if p.stats[k].opp else '-'
-                text = ('%s: plays %s of hands, raises %s preflop, 3-bets %s, folds to c-bets %s, aggression %.1f '
-                        '(%d hands)' % (seat.name, pct('vpip'), pct('pfr'), pct('three_bet'), pct('fold_cbet'),
-                                        p.af(), p.hands))
+                text = ('%s (%d hands): plays %s, raises %s, 3-bets %s, folds to c-bets %s, aggression %.1f'
+                        % (seat.name, p.hands, pct('vpip'), pct('pfr'), pct('three_bet'), pct('fold_cbet'), p.af()))
             else:
                 text = '%s: no hands seen yet' % seat.name
             if style and not seat.name.startswith('Bot '):
-                text += '  —  ' + style
-        self.status.configure(text=text)
+                text += '\n' + style
+        self.status.configure(text=text, fg='#ffe082', bg='#263238')
+        self.status_bar.configure(bg='#263238')
 
     def hand_help(self, st):
         '''Plain-English description of the hero's spot.'''
