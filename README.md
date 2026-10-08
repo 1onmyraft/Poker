@@ -25,7 +25,9 @@ the card images with Pillow if installed, or its own small PNG decoder (about a 
 A python.org Python (Tk 8.6) looks and behaves best on macOS; on Linux install `python3-tk`.
 Every loaded image is checked against the PNG; if Tk can't show images at all, cards and the
 table are drawn as shapes instead. `python poker_bots_gui.py --diagnose` prints what your
-Python/Tk does with the images.
+Python/Tk does with the images, `--selftest` opens a window that only draws the table and a
+board, and `--draw-cards` always draws cards as shapes (a workaround for Tk builds that won't
+display images).
 The original `poker_gui.py` needs PySimpleGUI 3 and an old matplotlib, and is left unchanged.
 
 ### Bot simulator (`sim/`)
