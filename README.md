@@ -19,8 +19,10 @@ seen; untick "show bot styles" to practise reading them from the HUD alone. Bust
 rebuy automatically. Hands are saved to `history/` in the 1onmyraftpoker format, so
 `python -m sim.backtest history/<file>.txt` scores your own play against the bots.
 
-Keys: F fold, C check/call, R bet/raise, Enter next hand. On macOS use the python.org
-installer (includes Tk) or `brew install python-tk`; on Linux install `python3-tk`.
+Keys: F fold, C check/call, R bet/raise, Enter next hand. Any Python 3.8+ with tkinter works,
+including the one bundled with Xcode/macOS: its old Tk 8.5 can't read PNG, so the GUI then loads
+the card images with Pillow if installed, or its own small PNG decoder (about a second at start-up).
+A python.org Python (Tk 8.6) looks and behaves best on macOS; on Linux install `python3-tk`.
 The original `poker_gui.py` needs PySimpleGUI 3 and an old matplotlib, and is left unchanged.
 
 ### Bot simulator (`sim/`)

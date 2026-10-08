@@ -12,8 +12,10 @@ Keys: F fold, C check/call, R bet/raise, Enter next hand.
 '''
 import math
 import os
+import struct
 import sys
 import tkinter as tk
+import zlib
 from datetime import datetime
 from tkinter import ttk, messagebox
 
@@ -48,6 +50,101 @@ BOT_INFO = {
 
 class QuitGame(Exception):
     pass
+
+
+# ------------------------------------------------------------- image loading
+# Tk only reads PNG from version 8.6. The Python that ships with Xcode/macOS still
+# uses Tk 8.5, so fall back to Pillow if installed, then to a tiny PNG decoder.
+FORCE_DECODER = os.environ.get('POKER_GUI_PNG') in ('decoder', 'put')   # for testing
+
+
+def decode_png(path, bg=(0, 0, 0)):
+    '''Decode an 8-bit, non-interlaced RGB/RGBA PNG; alpha is blended onto `bg`.
+    Returns (width, height, rgb bytes).'''
+    with open(path, 'rb') as f:
+        data = f.read()
+    if data[:8] != b'\x89PNG\r\n\x1a\n':
+        raise ValueError('not a PNG: %s' % path)
+    pos, idat = 8, []
+    while pos < len(data):
+        length, kind = struct.unpack('>I4s', data[pos:pos + 8])
+        chunk = data[pos + 8:pos + 8 + length]
+        if kind == b'IHDR':
+            w, h, depth, ctype, _, _, interlace = struct.unpack('>IIBBBBB', chunk)
+        elif kind == b'IDAT':
+            idat.append(chunk)
+        elif kind == b'IEND':
+            break
+        pos += 12 + length
+    if depth != 8 or ctype not in (2, 6) or interlace:
+        raise ValueError('unsupported PNG format in %s' % path)
+    bpp = 4 if ctype == 6 else 3
+    raw = zlib.decompress(b''.join(idat))
+    stride = w * bpp
+    out = bytearray(w * h * 3)
+    prev = bytearray(stride)
+    i = 0
+    for y in range(h):
+        ftype = raw[i]
+        line = bytearray(raw[i + 1:i + 1 + stride])
+        i += 1 + stride
+        if ftype == 1:
+            for x in range(bpp, stride):
+                line[x] = (line[x] + line[x - bpp]) & 255
+        elif ftype == 2:
+            for x in range(stride):
+                line[x] = (line[x] + prev[x]) & 255
+        elif ftype == 3:
+            for x in range(stride):
+                left = line[x - bpp] if x >= bpp else 0
+                line[x] = (line[x] + ((left + prev[x]) >> 1)) & 255
+        elif ftype == 4:
+            for x in range(stride):
+                a = line[x - bpp] if x >= bpp else 0
+                b = prev[x]
+                c = prev[x - bpp] if x >= bpp else 0
+                p = a + b - c
+                pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                pred = a if pa <= pb and pa <= pc else (b if pb <= pc else c)
+                line[x] = (line[x] + pred) & 255
+        o = y * w * 3
+        if bpp == 3:
+            out[o:o + w * 3] = line
+        else:
+            for x in range(w):
+                r, g, bl, al = line[4 * x:4 * x + 4]
+                out[o + 3 * x] = (r * al + bg[0] * (255 - al)) // 255
+                out[o + 3 * x + 1] = (g * al + bg[1] * (255 - al)) // 255
+                out[o + 3 * x + 2] = (bl * al + bg[2] * (255 - al)) // 255
+        prev = line
+    return w, h, bytes(out)
+
+
+def load_png(path, master, bg=(0, 0, 0)):
+    '''Load a PNG as a Tk image on any Tk version.'''
+    if not FORCE_DECODER:
+        try:
+            return tk.PhotoImage(master=master, file=path)          # Tk 8.6+
+        except tk.TclError:
+            pass
+        try:
+            from PIL import Image, ImageTk                         # Pillow, if installed
+            return ImageTk.PhotoImage(Image.open(path), master=master)
+        except Exception:
+            pass
+    w, h, rgb = decode_png(path, bg)
+    if os.environ.get('POKER_GUI_PNG') != 'put':
+        try:
+            return tk.PhotoImage(master=master, data=b'P6\n%d %d\n255\n' % (w, h) + rgb, format='PPM')
+        except tk.TclError:
+            pass
+    img = tk.PhotoImage(master=master, width=w, height=h)          # slowest, works everywhere
+    rows = []
+    for y in range(h):
+        row = rgb[y * w * 3:(y + 1) * w * 3]
+        rows.append('{' + ' '.join('#%02x%02x%02x' % tuple(row[3 * x:3 * x + 3]) for x in range(w)) + '}')
+    img.put(' '.join(rows), to=(0, 0))
+    return img
 
 
 class HumanAgent:
@@ -92,7 +189,10 @@ class PokerApp:
     def img(self, name):
         if name not in self.images:
             path = {'back': 'card_back.png', 'table': 'table.png'}.get(name, 'deck/%s.png' % name)
-            self.images[name] = tk.PhotoImage(file=os.path.join(RES, path))
+            # transparent pixels are blended onto what's behind: the room for the table,
+            # the table's felt for cards
+            bg = (0x0b, 0x3d, 0x2e) if name == 'table' else (0x1a, 0xbc, 0x9c)
+            self.images[name] = load_png(os.path.join(RES, path), self.root, bg)
         return self.images[name]
 
     # ---------------------------------------------------------------------- UI

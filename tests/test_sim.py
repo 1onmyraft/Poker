@@ -313,11 +313,34 @@ class TestSession(unittest.TestCase):
             s.play_hand(CallingHuman(), observer=Watch())
         self.assertEqual(sum(x.stack for x in s.seats), sum(x.buyins for x in s.seats) * s.buy_in)
         self.assertEqual(set(seen), set(range(7)))
-        hands = parse_hands(open(path, encoding='utf-8').read())
+        with open(path, encoding='utf-8') as f:
+            hands = parse_hands(f.read())
         self.assertEqual(len(hands), 60)
         for ph in hands:
             replay(ph)
         self.assertEqual(sum(ph.net('Hero') for ph in hands), s.human.won)
+
+
+class TestPngFallback(unittest.TestCase):
+
+    def test_decoder_reads_all_resources(self):
+        # Tk 8.5 (Xcode/macOS system Python) can't read PNG; the GUI falls back to this
+        import glob
+        import os
+        import sys
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        try:
+            from poker_bots_gui import decode_png
+        except ImportError:          # this Python has no tkinter: nothing to test
+            self.skipTest('tkinter not available')
+        files = glob.glob(os.path.join(here, 'resources', '**', '*.png'), recursive=True)
+        self.assertGreaterEqual(len(files), 54)
+        for f in files:
+            w, h, rgb = decode_png(f)
+            self.assertEqual(len(rgb), w * h * 3)
+        self.assertEqual(decode_png(os.path.join(here, 'resources', 'table.png'))[:2], (800, 412))
 
 
 class TestCalibrate(unittest.TestCase):
