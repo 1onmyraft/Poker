@@ -101,6 +101,8 @@ class DecisionState:
     history: list            # all ActionEvents this hand so far
     preflop_aggressor: int   # seat of last preflop raiser, or None
     raises_this_street: int
+    street_bets: list = None  # every seat's chips in this street (for display)
+    folded: list = None       # every seat's folded flag (for display)
 
     def legal(self):
         kinds = [FOLD] if self.to_call > 0 else [CHECK]
@@ -185,8 +187,10 @@ class Table:
             if kind == 'straddle':
                 first_pre = (seat + 1) % n
 
-        for b in bots:
+        for i, b in enumerate(bots):
             b.new_hand(hand_id)
+            if hasattr(b, 'receive_cards'):     # e.g. a human player's GUI
+                b.receive_cards(list(hole[i]))
 
         pf_aggressor = None
         allin_known = None   # board cards known when the remaining players got all-in
@@ -256,7 +260,8 @@ class Table:
                 big_blind=self.bb, n_active=len(active), active_seats=active,
                 names=h.names, positions=h.positions, stacks=list(stacks),
                 street_actions=list(street_actions), history=list(h.actions),
-                preflop_aggressor=pf_agg, raises_this_street=raises)
+                preflop_aggressor=pf_agg, raises_this_street=raises,
+                street_bets=list(street_bet), folded=list(folded))
             act = self._sanitize(bots[seat].act(st), st, getattr(bots[seat], 'free_fold', False))
             pot_before = sum(invested)
 

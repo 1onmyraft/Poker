@@ -291,6 +291,35 @@ class TestAnteAndHunter(unittest.TestCase):
         self.assertEqual((tr.get('bb').stats['donk'].count, tr.get('bb').stats['donk'].opp), (1, 1))
 
 
+class TestSession(unittest.TestCase):
+
+    def test_session_conserves_chips_and_saves_history(self):
+        import os
+        import tempfile
+        from sim.session import Session, CallingHuman
+        path = os.path.join(tempfile.mkdtemp(), 'h.txt')
+        s = Session(['Hunter', 'AnteMax', 'Maniac', 'AnteTAG', 'Station', 'Nervous'], seed=3,
+                    history_path=path)
+        seen = []
+
+        class Watch:
+            def before_action(self, t, st):
+                seen.append(t)
+
+            def after_action(self, t, st, a):
+                pass
+
+        for _ in range(60):
+            s.play_hand(CallingHuman(), observer=Watch())
+        self.assertEqual(sum(x.stack for x in s.seats), sum(x.buyins for x in s.seats) * s.buy_in)
+        self.assertEqual(set(seen), set(range(7)))
+        hands = parse_hands(open(path, encoding='utf-8').read())
+        self.assertEqual(len(hands), 60)
+        for ph in hands:
+            replay(ph)
+        self.assertEqual(sum(ph.net('Hero') for ph in hands), s.human.won)
+
+
 class TestCalibrate(unittest.TestCase):
 
     def test_distance_is_zero_on_itself_and_grows(self):

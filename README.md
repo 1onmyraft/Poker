@@ -4,6 +4,25 @@
 
 This is a simple Texas Hold 'em game running on MacOS. All scripts are written in pure Python. The main GUI is written using the Python module `PySimpleGUI`, and hand evaluation is done by refering to a hand value table pre-calculated together with Monte Carlo simulation. See [here](https://allenfrostline.com/2019/04/09/texas-holdem-series-4/) for detailed explanation of hand evaluation. Together with the GUI version, I also include here a primitive commmandline version with `ColorPrint` support, which you may download and include from this [repo](https://github.com/allenfrostline/Python-Color-Print). The two versions are supposed to work identically.
 
+### Play against the bots (`poker_bots_gui.py`)
+
+```
+python poker_bots_gui.py
+```
+
+A tkinter table (standard library only, uses the card images in `resources/`) where you play
+against any mix of the simulator's bots: **Hunter**, **AnteMax**, **Maniac**, **AnteTAG**, fish
+(**Station**, **Nervous**, **Scared**, **Terrified**) and regulars (Nit, LAG, TAG, Exploit).
+Choose the ante game (10/10 + 10 ante, like the sample histories) or a classic 5/10 game, the
+buy-in, and each seat's bot. A HUD under each bot shows VPIP/PFR/3-bet, aggression and hands
+seen; untick "show bot styles" to practise reading them from the HUD alone. Busted players
+rebuy automatically. Hands are saved to `history/` in the 1onmyraftpoker format, so
+`python -m sim.backtest history/<file>.txt` scores your own play against the bots.
+
+Keys: F fold, C check/call, R bet/raise, Enter next hand. On macOS use the python.org
+installer (includes Tk) or `brew install python-tk`; on Linux install `python3-tk`.
+The original `poker_gui.py` needs PySimpleGUI 3 and an old matplotlib, and is left unchanged.
+
 ### Bot simulator (`sim/`)
 
 A headless, dependency-free no-limit hold'em simulator for tuning bots (no GUI, no `hv.json` needed):
