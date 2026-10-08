@@ -12,6 +12,7 @@ range contains no aces at all.
 - `RangeTracker`: rebuilds every opponent's range from the hand's public actions.
 '''
 import bisect
+import math
 import random
 from itertools import combinations
 
@@ -185,6 +186,11 @@ class RangeTracker:
         if last is None:                                  # hasn't acted preflop (e.g. a blind walk)
             return Range()
         kind, rb = last
+        if self.stats is not None:                       # on tilt after a big loss: wider ranges
+            tilt = self.stats.tells.get(name, (None, None))[1]
+            if tilt is not None and tilt.tilted_now():
+                widen = 1.0 + min(1.0, tilt.effect())
+                vpip, pfr, tb = min(1.0, vpip * widen), min(1.0, pfr * widen), min(0.5, tb * widen)
         if kind == RAISE and rb == 0:                     # open raise
             return Range.band(0.0, max(0.03, pfr))
         if kind == RAISE:                                 # 3-bet or more: the top of their range
@@ -192,7 +198,7 @@ class RangeTracker:
         if kind == CALL and rb == 0:                      # limp
             return Range.band(max(0.0, pfr * 0.5), min(1.0, max(vpip, pfr + 0.15)), floor=0.05)
         if kind == CALL:                                  # flat a raise
-            return Range.band(min(pfr, 0.06), min(1.0, max(vpip, pfr + 0.08)), floor=0.03)
+            return Range.band(min(pfr, 0.06), min(1.0, max(vpip, pfr + 0.08)), floor=0.05)
         return Range()                                    # checked the big blind: anything
 
     def range_for(self, st, seat, dead):
@@ -212,22 +218,53 @@ class RangeTracker:
                 continue
             board = st.board[:board_at[a.street]]
             r.remove(board)
-            self._narrow(r, a.kind, board, a.to_call, a.pot)
+            self._narrow(r, a.kind, board, a.to_call, a.pot, self._style(st.names[seat]),
+                         self._tell(st.names[seat], a))
         self._cache[key] = (len(st.history), r)
         return r.copy().remove(list(st.board) + list(dead))
 
+    def _tell(self, name, a):
+        '''Timing tell: >0 if this action's speed has meant strength for this player, <0 weakness.'''
+        if self.stats is None or a.think_ms is None or name not in self.stats.tells:
+            return 0.0
+        tm = self.stats.tells[name][0]
+        r, n = tm.tell(a.kind)
+        if abs(r) < 0.15:
+            return 0.0
+        return max(-1.5, min(1.5, r * tm.z(a.kind, a.think_ms)))
+
+    def _style(self, name):
+        '''
+        How much this player's actions tell us, from their stats:
+        call_info - 0 for a station (calls with anything, so a call says little), 1 normally
+        bet_info  - high for passive players (a bet means strength), lower for maniacs
+        '''
+        p = self.stats.players.get(name) if self.stats else None
+        if not p or p.hands < 15:
+            return 1.0, 1.0
+        fvb = p.rate('fvb', k=20)            # folds to bets: low = sticky
+        afq = p.rate('afq', k=20)            # share of aggressive actions
+        call_info = min(1.0, max(0.1, (fvb - 0.15) / 0.35))
+        bet_info = min(1.4, max(0.35, (0.75 - afq) / 0.35))
+        return call_info, bet_info
+
     @staticmethod
-    def _narrow(r, kind, board, to_call, pot):
+    def _narrow(r, kind, board, to_call, pot, style=(1.0, 1.0), tell=0.0):
         if kind not in (BET, RAISE, CALL, CHECK):
             return
+        call_info, bet_info = style
         for i, c in enumerate(COMBOS):
             if r.w[i] <= 0 or c[0] in board or c[1] in board:
                 continue
             s = _combo_strength(i, board)
             if kind in (BET, RAISE):
                 f = 0.15 + 0.85 * s ** 1.5 + (0.2 if 0.25 < s < 0.5 else 0.0)   # value + some draws/bluffs
+                f = f ** bet_info                     # passive players' bets mean more
             elif kind == CALL:
                 f = 0.3 + 0.7 * min(1.0, s * 1.6) * (1.0 if s < 0.9 else 0.8)  # medium hands, few nuts
+                f = 1.0 - call_info * (1.0 - f)       # stations call with anything
             else:
                 f = 1.0 if s < 0.85 else 0.55                                  # checks: fewer monsters
+            if tell:
+                f *= math.exp(1.6 * tell * (s - 0.5))   # their timing pointed strong (+) or weak (-)
             r.w[i] *= f

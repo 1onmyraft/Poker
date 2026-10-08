@@ -9,6 +9,7 @@ and an optional `observer`, which makes the whole thing testable headless.
 '''
 import os
 import random
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -58,6 +59,8 @@ class _Watched:
         self.table_seat = table_seat
         self.observer = observer
         self.free_fold = False
+        self.last_think_ms = None
+        self.timed = not hasattr(inner, 'params_for') and not hasattr(inner, 'p')   # humans only
 
     def new_hand(self, hand_id):
         self.inner.new_hand(hand_id)
@@ -72,7 +75,11 @@ class _Watched:
     def act(self, st):
         if self.observer:
             self.observer.before_action(self.table_seat, st)
+        t0 = time.monotonic()
         action = Table._sanitize(self.inner.act(st), st)
+        self.last_think_ms = (time.monotonic() - t0) * 1000 if self.timed else None
+        if getattr(self.inner, 'reported_think_ms', None) is not None:     # replays / tests
+            self.last_think_ms = self.inner.reported_think_ms
         if self.observer:
             self.observer.after_action(self.table_seat, st, action)
         return action
@@ -81,11 +88,13 @@ class _Watched:
 class Session:
 
     def __init__(self, lineup=DEFAULT_LINEUP, structure='ante', buy_in_bb=100, human_name='You',
-                 seed=None, history_path=None, rake=0.0, rake_cap=None, label_styles=True):
+                 seed=None, history_path=None, rake=0.0, rake_cap=None, label_styles=True, profile=None):
         '''
         lineup: bot kinds for the other seats (1-8 of them); the human sits in seat 0
         history_path: append every hand to this file in the 1onmyraftpoker format
         label_styles: name bots after their style ("Hunter") or anonymously ("Bot 3")
+        profile: a sim.profile.Profile; bots start out knowing you from earlier sessions,
+                 and every hand is added to it
         '''
         assert 1 <= len(lineup) <= 8
         self.struct = STRUCTURES[structure]
@@ -110,6 +119,21 @@ class Session:
         self.tracker = StatsTracker()
         self.history_path = history_path
         self.started = datetime.now()
+        self.profile = profile
+        if profile is not None:
+            profile.name = human_name
+            profile.seed(self.tracker)
+            for s in self.seats[1:]:
+                self._seed_bot(s.bot)
+            profile.start_session(structure, lineup)
+
+    def _seed_bot(self, bot):
+        '''Give a bot that keeps stats everything known about the human from earlier sessions.'''
+        from .stats import StatsTracker
+        if getattr(bot, 'tracker', None) is None and getattr(getattr(bot, 'p', None), 'smart', False):
+            bot.tracker = StatsTracker()
+        if getattr(bot, 'tracker', None) is not None:
+            self.profile.seed(bot.tracker)
 
     @property
     def human(self):
@@ -144,6 +168,7 @@ class Session:
             inner.name = s.name
             agents.append(_Watched(inner, t, observer))
         self.hand_no += 1
+        t_start = time.time()
         h = self.table.play_hand(agents, deck_seed=self.rng.randrange(10 ** 12), hand_id=self.hand_no,
                                  stacks=[self.seats[t].stack for t in order])
         net = {}
@@ -152,6 +177,8 @@ class Session:
             self.seats[t].won += h.winnings[j]
             net[t] = h.winnings[j]
         self.tracker.update(h)
+        if self.profile is not None:
+            self.profile.record_hand(h, order.index(0), t_start, time.time(), self.tracker)
         if self.history_path:
             self._save(h, order)
         self.button = (self.button + 1) % n

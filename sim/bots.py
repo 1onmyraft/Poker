@@ -149,11 +149,18 @@ class ParamBot(Bot):
     def value_size(self, st, p):
         return p.bet_size
 
+    def end_hand(self, h):
+        tr = getattr(self, 'tracker', None)
+        if tr is not None and type(self) is ParamBot:   # ExploitBot/Hunter update their own
+            tr.update(h)
+
     def hand_strength(self, st, p):
         '''(strength, multiway-adjusted strength) for postflop decisions.'''
         if p.smart:
             if getattr(self, '_ranges', None) is None:
-                self._ranges = RangeTracker(getattr(self, 'tracker', None))
+                if getattr(self, 'tracker', None) is None:
+                    self.tracker = StatsTracker()       # learn everyone's tendencies as we play
+                self._ranges = RangeTracker(self.tracker)
             dead = list(st.hole) + list(st.board)
             opp = [self._ranges.range_for(st, i, dead) for i in st.active_seats if i != st.seat]
             eq = equity(st.hole, st.board, opp, samples=p.eq_samples, rng=self.rng)

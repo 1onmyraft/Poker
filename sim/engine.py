@@ -51,6 +51,7 @@ class ActionEvent:
     to_call: int         # amount the player faced before acting
     pot: int             # pot before the action
     all_in: bool = False
+    think_ms: float = None   # how long the player took (recorded for humans; None for bots)
 
 
 @dataclass
@@ -302,6 +303,7 @@ class Table:
                     for i in pending:
                         can_raise[i] = can_raise.get(i, True) and i not in acted_since_full
             acted_since_full.add(seat)
+            ev.think_ms = getattr(bots[seat], 'last_think_ms', None)
             street_actions.append(ev)
             h.actions.append(ev)
         return aggressor

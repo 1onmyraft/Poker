@@ -26,6 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from sim.cards import describe, best_five, hand_code, evaluate, PF_PERCENTILE   # noqa: E402
 from sim.engine import Action, FOLD, CHECK, CALL, BET, RAISE        # noqa: E402
 from sim.session import Session, STRUCTURES, BOT_CHOICES, DEFAULT_LINEUP  # noqa: E402
+from sim.profile import Profile                                     # noqa: E402
 from sim.ranges import RangeTracker, equity                         # noqa: E402
 from sim.strength import _draws                                     # noqa: E402
 
@@ -33,6 +34,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 RES = os.path.join(HERE, 'resources')
 W, H = 1000, 560                 # table canvas
 CX, CY = W // 2, 262             # table centre
+PROFILE_PATH = os.path.join(HERE, 'history', 'profile.json')
 ROOM = '#0b3d2e'
 ROOM_RGB = (0x0b, 0x3d, 0x2e)
 FELT = ROOM
@@ -271,6 +273,7 @@ class PokerApp:
         self.cur = None
         self.disp = None
         self.range_tracker = None
+        self.profile = None
         self.choice = tk.StringVar()
         self.pause_var = tk.IntVar()
         self.speed = tk.StringVar(value='Normal')
@@ -332,6 +335,7 @@ class PokerApp:
         self.delta_lbl.pack(side='left', padx=(8, 10))
 
         tk.Button(top, text='New session', command=self.setup_dialog).pack(side='right', padx=4)
+        tk.Button(top, text='My profile', command=self.show_profile).pack(side='right', padx=4)
         tk.Checkbutton(top, text='Auto-deal', variable=self.auto_deal, bg=ROOM, fg='white',
                        selectcolor=ROOM, activebackground=ROOM).pack(side='right', padx=4)
         ttk.Combobox(top, textvariable=self.speed, values=list(SPEEDS), width=8,
@@ -525,8 +529,14 @@ class PokerApp:
             path = None
             if save.get():
                 path = os.path.join(HERE, 'history', datetime.now().strftime('session_%Y%m%d_%H%M%S.txt'))
+            if self.profile is not None:
+                self.profile.end_session()
+            self.profile = Profile(PROFILE_PATH)
             self.session = Session(lineup, structure=struct.get(), buy_in_bb=int(buy.get()),
-                                   history_path=path, label_styles=styles.get())
+                                   history_path=path, label_styles=styles.get(), profile=self.profile)
+            known = self.session.tracker.get('You').hands
+            if known:
+                self.log('The bots remember you: %d hands from earlier sessions (see My profile).' % known, 'info')
             d.destroy()
             self.dialog_open = False
             self.log_box.configure(state='normal')
@@ -1148,6 +1158,8 @@ class PokerApp:
         try:
             res = s.play_hand(HumanAgent(self), observer=self)
             self.show_result(res)
+            if self.profile is not None and s.hand_no % 3 == 0:
+                self.profile.save()
         except (QuitGame, tk.TclError):
             return
         finally:
@@ -1232,7 +1244,33 @@ class PokerApp:
             self.log('You: %+d chips (%+.1f bb) this hand' % (me, me / s.bb), 'hero')
         self.update_bankroll()
 
+    def show_profile(self):
+        '''Window with everything the game has learned about you.'''
+        prof = self.profile or Profile(PROFILE_PATH)
+        w = tk.Toplevel(self.root)
+        w.title('My profile')
+        txt = tk.Text(w, width=96, height=34, wrap='word', bg='#0f2a22', fg='#e0e0e0', font=('Helvetica', 12),
+                      padx=12, pady=10)
+        txt.tag_configure('h', foreground='#ffd54f', font=('Helvetica', 14, 'bold'))
+        for head, lines in prof.report():
+            txt.insert('end', head + '\n', 'h')
+            for line in lines:
+                txt.insert('end', '  ' + line + '\n')
+            txt.insert('end', '\n')
+        txt.insert('end', 'Saved on this computer only: %s\n' % os.path.relpath(PROFILE_PATH, HERE))
+        txt.configure(state='disabled')
+        tk.Button(w, text='Close', command=w.destroy).pack(side='bottom', pady=6)
+        sb = tk.Scrollbar(w, command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        sb.pack(side='right', fill='y')
+        txt.pack(side='left', fill='both', expand=True)
+
     def on_close(self):
+        if self.profile is not None:
+            try:
+                self.profile.end_session()
+            except OSError:
+                pass
         self.closing = True
         self.choice.set('quit')
         self.pause_var.set(self.pause_var.get() + 1)

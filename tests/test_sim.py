@@ -422,6 +422,57 @@ class TestPushFold(unittest.TestCase):
             self.assertEqual(sum(h.winnings), 0)
 
 
+class TestTellsAndProfile(unittest.TestCase):
+
+    def test_timing_model_learns_fast_means_strong(self):
+        import random
+        from sim.tells import TimingModel
+        rng = random.Random(1)
+        tm = TimingModel()
+        for _ in range(60):
+            strong = rng.random() < 0.5
+            ms = rng.uniform(300, 900) if strong else rng.uniform(4000, 8000)
+            tm.observe('bet', ms)
+            tm.learn('bet', ms, 0.85 if strong else 0.15)
+        r, n = tm.tell('bet')
+        self.assertLess(r, -0.7)
+        self.assertGreater(tm.z('bet', 7000), 0.5)          # slow for this player
+        self.assertEqual(TimingModel().tell('bet'), (0.0, 0))  # no data, no tell
+
+    def test_tilt_model(self):
+        from sim.tells import TiltModel
+        t = TiltModel()
+        for i in range(200):
+            t.update(vpip=(i % 4 == 0), net_bb=-40 if i % 25 == 0 else 1)
+            if t.since_loss is not None and t.since_loss < 10:
+                t.after[1] += 1                               # loosen up after big losses
+        self.assertGreater(t.effect(), 0.15)
+
+    def test_profile_records_and_persists(self):
+        import os
+        import tempfile
+        from sim.profile import Profile
+        from sim.session import Session
+
+        from sim.session import CallingHuman
+
+        class Slow(CallingHuman):
+            reported_think_ms = 1200
+        path = os.path.join(tempfile.mkdtemp(), 'p.json')
+        prof = Profile(path)
+        s = Session(['Hunter', 'Wizard', 'Station'], seed=2, profile=prof)
+        for _ in range(30):
+            s.play_hand(Slow())
+        prof.end_session()
+        again = Profile(path)
+        self.assertEqual(len(again.hands()), 30)
+        heads = [h for h, _ in again.report()]
+        self.assertIn('Timing tells (what your speed gives away)', heads)
+        s2 = Session(['Hunter', 'Wizard'], seed=3, profile=Profile(path))
+        self.assertEqual(s2.seats[1].bot.tracker.get('You').hands, 30)   # bots remember you
+        self.assertTrue(all(d[2] == 1200 for h in again.hands() for d in h['decisions']))
+
+
 class TestCalibrate(unittest.TestCase):
 
     def test_distance_is_zero_on_itself_and_grows(self):

@@ -90,6 +90,33 @@ class StatsTracker:
 
     def __init__(self):
         self.players = {}
+        self.tells = {}              # name -> (TimingModel, TiltModel), see sim/tells.py
+
+    def timing(self, name):
+        from .tells import TimingModel, TiltModel
+        return self.tells.setdefault(name, (TimingModel(), TiltModel()))[0]
+
+    def tilt(self, name):
+        from .tells import TimingModel, TiltModel
+        return self.tells.setdefault(name, (TimingModel(), TiltModel()))[1]
+
+    # persistence of one player's read (used for the human's profile)
+    def export_player(self, name):
+        p = self.get(name)
+        tm, tilt = self.tells.get(name, (None, None))
+        return {'hands': p.hands, 'net': p.net, 'post_aggr': p.post_aggr, 'post_calls': p.post_calls,
+                'stats': {k: [s.count, s.opp] for k, s in p.stats.items()},
+                'timing': tm.to_dict() if tm else None, 'tilt': tilt.to_dict() if tilt else None}
+
+    def import_player(self, name, d):
+        from .tells import TimingModel, TiltModel
+        p = self.get(name)
+        p.hands, p.net = d.get('hands', 0), d.get('net', 0.0)
+        p.post_aggr, p.post_calls = d.get('post_aggr', 0), d.get('post_calls', 0)
+        for k, (c, o) in d.get('stats', {}).items():
+            p.stats[k] = Stat(c, o)
+        self.tells[name] = (TimingModel.from_dict(d['timing']) if d.get('timing') else TimingModel(),
+                            TiltModel.from_dict(d['tilt']) if d.get('tilt') else TiltModel())
 
     def get(self, name):
         if name not in self.players:
@@ -97,6 +124,8 @@ class StatsTracker:
         return self.players[name]
 
     def update(self, h):
+        from .tells import update_from_hand
+        update_from_hand(self.tells, h)
         ps = [self.get(name) for name in h.names]
         for i, p in enumerate(ps):
             p.hands += 1

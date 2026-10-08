@@ -25,6 +25,17 @@ explains every action in plain English and, on your turn, what you hold and what
 and the bankroll counter rolls up or down after each hand. Once you fold, the rest of the hand
 fast-forwards. Speed: Slow / Normal / Fast / Instant.
 
+**Bots that think in ranges.** Wizard (and Hunter, on top of it) keep a range for every opponent:
+all 1,326 two-card hands, weighted by what that player has done this hand and by their stats, with
+card removal for every card the bot can see (three aces on the flop and one in its hand means
+nobody else holds an ace). Postflop decisions use Monte Carlo equity against those ranges; short
+stacks (≤ 15-25 bb) use solved push/fold equilibrium charts (`resources/pushfold.json`, from
+`tools/solve_pushfold.py`). The bots also learn your **timing tells** from showdowns (fast or slow
+bets that turned out strong or weak), notice **tilt** (looser play after a big loss) and remember
+you between sessions. **My profile** shows what the game has learned about you: style, decision
+speed, timing tells, tilt, results by session length, breaks and position. It's stored only in
+`history/profile.json` on your computer.
+
 Keys: F fold, C or Space check/call, R bet/raise, 1-4 bet sizes (½, ⅔, pot, all-in), Up/Down
 adjust by a big blind, Enter or Space next hand. Any Python 3.8+ with tkinter works,
 including the one bundled with Xcode/macOS: its old Tk 8.5 can't read PNG, so the GUI then loads
