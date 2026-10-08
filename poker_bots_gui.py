@@ -120,31 +120,72 @@ def decode_png(path, bg=(0, 0, 0)):
     return w, h, bytes(out)
 
 
+def _looks_right(img, w, h, rgb):
+    """Check a loaded image really holds the picture: right size, and sampled pixels
+    match the decoded PNG. Some Tk 8.5 builds accept image data but stay blank."""
+    try:
+        if img.width() != w or img.height() != h:
+            return False
+        for fx, fy in ((0.5, 0.5), (0.3, 0.4), (0.7, 0.6), (0.5, 0.25), (0.45, 0.75)):
+            x, y = int(fx * (w - 1)), int(fy * (h - 1))
+            got = img.get(x, y)
+            if isinstance(got, str):
+                got = tuple(int(v) for v in got.split())
+            k = (y * w + x) * 3
+            if any(abs(int(a) - b) > 2 for a, b in zip(got, rgb[k:k + 3])):
+                return False
+        return True
+    except (tk.TclError, ValueError, TypeError):
+        return False
+
+
 def load_png(path, master, bg=(0, 0, 0)):
-    '''Load a PNG as a Tk image on any Tk version.'''
-    if not FORCE_DECODER:
+    """Load a PNG as a Tk image on any Tk version.
+
+    Returns (image or None, how it was loaded). None means every method failed and
+    the caller should draw the card/table itself."""
+    mode = os.environ.get('POKER_GUI_PNG', '')      # testing: decoder / put / blankppm / vector
+    if mode == 'vector':
+        return None, 'vector (forced)'
+    if not mode:
         try:
-            return tk.PhotoImage(master=master, file=path)          # Tk 8.6+
+            return tk.PhotoImage(master=master, file=path), 'Tk PNG'         # Tk 8.6+
         except tk.TclError:
             pass
         try:
-            from PIL import Image, ImageTk                         # Pillow, if installed
-            return ImageTk.PhotoImage(Image.open(path), master=master)
+            from PIL import Image, ImageTk                                 # Pillow, if installed
+            return ImageTk.PhotoImage(Image.open(path), master=master), 'Pillow'
         except Exception:
             pass
-    w, h, rgb = decode_png(path, bg)
-    if os.environ.get('POKER_GUI_PNG') != 'put':
+    try:
+        w, h, rgb = decode_png(path, bg)
+    except (OSError, ValueError, zlib.error):
+        return None, 'vector (could not decode %s)' % os.path.basename(path)
+    if mode != 'put':
         try:
-            return tk.PhotoImage(master=master, data=b'P6\n%d %d\n255\n' % (w, h) + rgb, format='PPM')
+            if mode == 'blankppm':       # simulate a Tk that accepts the data but shows nothing
+                img = tk.PhotoImage(master=master, width=w, height=h)
+            else:
+                img = tk.PhotoImage(master=master, data=b'P6\n%d %d\n255\n' % (w, h) + rgb, format='PPM')
+            if _looks_right(img, w, h, rgb):
+                return img, 'decoder + PPM'
         except tk.TclError:
             pass
-    img = tk.PhotoImage(master=master, width=w, height=h)          # slowest, works everywhere
-    rows = []
-    for y in range(h):
-        row = rgb[y * w * 3:(y + 1) * w * 3]
-        rows.append('{' + ' '.join('#%02x%02x%02x' % tuple(row[3 * x:3 * x + 3]) for x in range(w)) + '}')
-    img.put(' '.join(rows), to=(0, 0))
-    return img
+    try:
+        img = tk.PhotoImage(master=master, width=w, height=h)                # slowest
+        rows = []
+        for y in range(h):
+            row = rgb[y * w * 3:(y + 1) * w * 3]
+            rows.append('{' + ' '.join('#%02x%02x%02x' % tuple(row[3 * x:3 * x + 3]) for x in range(w)) + '}')
+        img.put(' '.join(rows), to=(0, 0))
+        if _looks_right(img, w, h, rgb):
+            return img, 'decoder + put'
+    except tk.TclError:
+        pass
+    return None, 'vector (Tk could not show the image)'
+
+
+SUIT_SYMBOL = {'s': '\u2660', 'h': '\u2665', 'd': '\u2666', 'c': '\u2663'}
 
 
 class HumanAgent:
@@ -176,6 +217,7 @@ class PokerApp:
         root.protocol('WM_DELETE_WINDOW', self.on_close)
         self.closing = False
         self.images = {}
+        self.image_methods = {}
         self.session = None
         self.in_hand = False
         self.choice = tk.StringVar()
@@ -187,13 +229,41 @@ class PokerApp:
 
     # ------------------------------------------------------------------ images
     def img(self, name):
+        '''Tk image for a card / 'back' / 'table', or None if it has to be drawn by hand.'''
         if name not in self.images:
             path = {'back': 'card_back.png', 'table': 'table.png'}.get(name, 'deck/%s.png' % name)
             # transparent pixels are blended onto what's behind: the room for the table,
             # the table's felt for cards
             bg = (0x0b, 0x3d, 0x2e) if name == 'table' else (0x1a, 0xbc, 0x9c)
-            self.images[name] = load_png(os.path.join(RES, path), self.root, bg)
+            img, how = load_png(os.path.join(RES, path), self.root, bg)
+            self.images[name] = img
+            self.image_methods[how] = self.image_methods.get(how, 0) + 1
         return self.images[name]
+
+    def draw_card(self, x, y, card):
+        img = self.img(card)
+        if img is not None:
+            self.canvas.create_image(x, y, image=img)
+            return
+        c = self.canvas
+        if card == 'back':
+            c.create_rectangle(x - 29, y - 43, x + 29, y + 43, fill='#c62828', outline='white', width=2)
+            c.create_rectangle(x - 22, y - 36, x + 22, y + 36, outline='#ffcdd2')
+            return
+        rank, suit = card[0], card[1]
+        colour = '#c62828' if suit in 'hd' else '#111111'
+        rank = '10' if rank == 'T' else rank
+        c.create_rectangle(x - 29, y - 43, x + 29, y + 43, fill='white', outline='#333', width=2)
+        c.create_text(x - 20, y - 30, text=rank, fill=colour, font=('Helvetica', 15, 'bold'))
+        c.create_text(x, y + 6, text=SUIT_SYMBOL[suit], fill=colour, font=('Helvetica', 30))
+
+    def draw_table(self):
+        img = self.img('table')
+        if img is not None:
+            self.canvas.create_image(CX, CY, image=img)
+            return
+        c = self.canvas
+        c.create_oval(CX - 400, CY - 206, CX + 400, CY + 206, fill='#17a589', outline='#0e6655', width=14)
 
     # ---------------------------------------------------------------------- UI
     def build_ui(self):
@@ -303,6 +373,7 @@ class PokerApp:
                 STRUCTURES[struct.get()]['label'], int(buy.get()), ', '.join(s.name for s in self.session.seats[1:])))
             if path:
                 self.log('Saving hands to %s' % os.path.relpath(path, HERE))
+            self.preload_images()
             self.draw_idle()
             self.b_next.configure(state='normal')
             self.next_hand()
@@ -320,13 +391,13 @@ class PokerApp:
         '''view: dict with per-table-seat stacks, bets, folded, cards, labels, board, pot, actor, ...'''
         c = self.canvas
         c.delete('all')
-        c.create_image(CX, CY, image=self.img('table'))
+        self.draw_table()
         s = self.session
         bb = s.bb
         # board and pot
         board = view.get('board', [])
         for i, card in enumerate(board):
-            c.create_image(CX - 132 + 66 * i, CY - 18, image=self.img(card))
+            self.draw_card(CX - 132 + 66 * i, CY - 18, card)
         if view.get('pot') is not None:
             c.create_text(CX, CY + 48, text='Pot %s' % self.fmt(view['pot']), fill='white',
                           font=('Helvetica', 15, 'bold'))
@@ -358,7 +429,7 @@ class PokerApp:
             if cards and not folded:
                 cx, cy = self.seat_xy(t, 0.70)
                 for k, card in enumerate(cards):
-                    c.create_image(cx - 18 + 36 * k, cy, image=self.img(card))
+                    self.draw_card(cx - 18 + 36 * k, cy, card)
             # chips in front
             bet = view['bets'][t]
             if bet:
@@ -582,7 +653,41 @@ class PokerApp:
         self.root.after(10, self.root.destroy)
 
 
+    def preload_images(self):
+        '''Load every image up front (so any slow fallback happens once) and report how.'''
+        if self.image_methods:
+            return
+        for name in ['table', 'back'] + [r + s for r in '23456789TJQKA' for s in 'shdc']:
+            self.img(name)
+        how = ', '.join('%s x%d' % kv for kv in sorted(self.image_methods.items()))
+        self.log('Images (Python %s, Tk %s): %s' % (sys.version.split()[0], tk.TkVersion, how))
+
+
+def diagnose():
+    '''python poker_bots_gui.py --diagnose : report what this Python/Tk can do with the images.'''
+    print('Python', sys.version.replace('\n', ' '))
+    print('Tk', tk.TkVersion, '| Tcl', tk.TclVersion, '| windowing system:', end=' ')
+    root = tk.Tk()
+    root.withdraw()
+    print(root.tk.call('tk', 'windowingsystem'))
+    try:
+        import PIL
+        print('Pillow', PIL.__version__)
+    except ImportError:
+        print('Pillow not installed')
+    for name in ('table.png', 'card_back.png', 'deck/As.png', 'deck/Td.png'):
+        path = os.path.join(RES, name)
+        img, how = load_png(path, root)
+        w, h, rgb = decode_png(path)
+        ok = img is not None and _looks_right(img, w, h, rgb) if how != 'Tk PNG' else img is not None
+        print('  %-14s -> %-38s %s' % (name, how, 'OK' if ok else 'PROBLEM'))
+    root.destroy()
+
+
 def main():
+    if '--diagnose' in sys.argv:
+        diagnose()
+        return
     root = tk.Tk()
     PokerApp(root)
     root.mainloop()
