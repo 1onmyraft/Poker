@@ -91,6 +91,17 @@ PRESETS['AnteTAG'] = Params(
     value=0.62, bluff=0.10, cbet=0.60, semibluff=0.5, call_margin=0.10, fear=0.0,
     raise_value=0.84, raise_bluff=0.03, bet_size=0.55)
 
+# AnteTAG's parameters tuned for win rate by sim/tune.py against the rule-bot zoo
+# (fish, passive and regs tables). It became a preflop maniac (VPIP ~74, PFR ~59,
+# 3-bet ~22%, steals every time) that gives up postflop. It crushes opponents that
+# over-fold to raises and never adapt, but its edge mostly disappears against
+# adaptive ExploitBots - prefer AnteTAG unless you know opponents don't adjust.
+PRESETS['AnteMax'] = Params(
+    open=0.533, pos_spread=3.0, steal_mult=1.192, limp=0.0, call_open=0.284, bb_defend=2.277,
+    threebet=0.224, call_3bet=0.106, fourbet=0.072, open_size=2.921, iso=1.664,
+    iso_per_limper=0.951, value=0.499, bluff=0.175, cbet=0.215, semibluff=0.48,
+    call_margin=0.126, fear=0.501, raise_value=0.746, raise_bluff=0.004, bet_size=0.622)
+
 
 class Bot:
 
@@ -379,6 +390,8 @@ def make_bot(kind, name=None, seed=0):
         return Hunter(name, seed=seed)
     if kind == 'HunterPool':
         return Hunter(name, seed=seed, pool_mode=True)
+    if kind.startswith('Hunter:'):            # Hunter on top of another preset, e.g. 'Hunter:LAG'
+        return Hunter(name, params=PRESETS[kind.split(':', 1)[1]], seed=seed)
     if kind.startswith('Exploit-'):
         return ExploitBot(name, seed=seed, disabled=kind.split('-')[1:])
     return ParamBot(name, PRESETS[kind], seed=seed)
