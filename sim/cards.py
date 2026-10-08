@@ -121,3 +121,34 @@ def preflop_strength(hole):
 def best_five(cards):
     '''Best 5-card subset (for display only; slow).'''
     return max(combinations(cards, 5), key=evaluate)
+
+
+RANK_NAME = {2: 'Two', 3: 'Three', 4: 'Four', 5: 'Five', 6: 'Six', 7: 'Seven', 8: 'Eight', 9: 'Nine',
+             10: 'Ten', 11: 'Jack', 12: 'Queen', 13: 'King', 14: 'Ace'}
+
+
+def _plural(r):
+    return 'Sixes' if r == 6 else RANK_NAME[r] + 's'
+
+
+def describe(cards):
+    '''Plain-English name of the best hand in 5-7 cards, e.g. "Two Pair, Kings and Fives".'''
+    v = evaluate(cards)
+    cat, r = v[0], v[1:]
+    if cat == STRAIGHT_FLUSH:
+        return 'Royal Flush' if r[0] == 14 else 'Straight Flush, %s-high' % RANK_NAME[r[0]]
+    if cat == QUADS:
+        return 'Four %s' % _plural(r[0])
+    if cat == FULL_HOUSE:
+        return 'Full House, %s full of %s' % (_plural(r[0]), _plural(r[1]))
+    if cat == FLUSH:
+        return 'Flush, %s-high' % RANK_NAME[r[0]]
+    if cat == STRAIGHT:
+        return 'Straight, %s-high' % RANK_NAME[r[0]]
+    if cat == TRIPS:
+        return 'Three %s' % _plural(r[0])
+    if cat == TWO_PAIR:
+        return 'Two Pair, %s and %s' % (_plural(r[0]), _plural(r[1]))
+    if cat == PAIR:
+        return 'Pair of %s' % _plural(r[0])
+    return '%s-high' % RANK_NAME[r[0]]

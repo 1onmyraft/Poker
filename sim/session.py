@@ -12,8 +12,8 @@ import random
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from .bots import make_bot, PRESETS
-from .engine import Table, Action, FOLD, CHECK, CALL
+from .bots import make_bot
+from .engine import Table, Action, CHECK, CALL
 from .handhistory import write_hand
 from .stats import StatsTracker
 
@@ -122,13 +122,20 @@ class Session:
         names = position_names(n)
         return {(self.button + j) % n: names[j] for j in range(n)}
 
-    def play_hand(self, human_agent, observer=None):
-        '''Play one hand. human_agent.act(DecisionState) -> Action. Returns a HandResult.'''
-        n = len(self.seats)
-        for s in self.seats:            # rebuy anyone who busted
+    def rebuy_busted(self):
+        '''Top busted players back up to the buy-in. Returns the seats that rebought.'''
+        rebought = []
+        for i, s in enumerate(self.seats):
             if s.stack <= 0:
                 s.stack = self.buy_in
                 s.buyins += 1
+                rebought.append(i)
+        return rebought
+
+    def play_hand(self, human_agent, observer=None):
+        '''Play one hand. human_agent.act(DecisionState) -> Action. Returns a HandResult.'''
+        n = len(self.seats)
+        self.rebuy_busted()
         order = [(self.button + j) % n for j in range(n)]     # engine seat -> table seat
         agents = []
         for t in order:

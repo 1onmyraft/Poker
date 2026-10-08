@@ -51,6 +51,14 @@ class TestEvaluator(unittest.TestCase):
                            evaluate(['Ah', 'Jd', 'Qs', 'Qc', '7d', '3h', '2s']))
         self.assertEqual(evaluate(['Ah', 'Kd', '9s', '9c', '9d', '9h', '2s'])[0], 7)
 
+    def test_describe(self):
+        from sim.cards import describe
+        self.assertEqual(describe(['Kd', 'Ks', '5c', '5d', '9h', '2c', '3s']), 'Two Pair, Kings and Fives')
+        self.assertEqual(describe(['6h', '6d', '6c', 'Ks', 'Kd']), 'Full House, Sixes full of Kings')
+        self.assertEqual(describe(['5h', '4d', '3c', '2s', 'Ah']), 'Straight, Five-high')
+        self.assertEqual(describe(['Ah', 'Kh', 'Qh', 'Jh', 'Th']), 'Royal Flush')
+        self.assertEqual(describe(['Ah', '7d', '2c', '5h', '9s']), 'Ace-high')
+
     def test_preflop_strength(self):
         self.assertGreater(preflop_strength(['Ah', 'Ad']), 0.99)
         self.assertLess(preflop_strength(['7h', '2d']), 0.01)

@@ -3,12 +3,13 @@ Play Texas Hold'em against the simulator's bots (Hunter, AnteMax, Maniac, AnteTA
 
     python poker_bots_gui.py
 
-Uses only the standard library (tkinter) plus the cards in resources/. Rules,
-bots and hand evaluation come from sim/. Every hand can be saved in the
-1onmyraftpoker text format (history/), so you can run
-`python -m sim.backtest history/<file>.txt` on your own play afterwards.
+Standard library only (tkinter) plus the images in resources/. Rules, bots and hand
+evaluation come from sim/. Every hand can be saved in the 1onmyraftpoker text format
+(history/), so `python -m sim.backtest history/<file>.txt` scores your own play.
 
-Keys: F fold, C check/call, R bet/raise, Enter next hand.
+Keys: F fold, C or Space check/call, R raise, 1-4 bet sizes, Up/Down adjust the
+amount by a big blind, Enter or Space next hand.
+Options: --draw-cards (draw cards as shapes), --selftest, --diagnose.
 '''
 import math
 import os
@@ -21,17 +22,25 @@ from tkinter import ttk, messagebox
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from sim.cards import evaluate                      # noqa: E402
-from sim.engine import Action, FOLD, CHECK, CALL, BET, RAISE, PREFLOP  # noqa: E402
-from sim.handhistory import HAND_NAMES             # noqa: E402
+from sim.cards import describe, best_five, hand_code, evaluate, PF_PERCENTILE   # noqa: E402
+from sim.engine import Action, FOLD, CHECK, CALL, BET, RAISE        # noqa: E402
 from sim.session import Session, STRUCTURES, BOT_CHOICES, DEFAULT_LINEUP  # noqa: E402
+from sim.strength import _draws                                     # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RES = os.path.join(HERE, 'resources')
 W, H = 1000, 560                 # table canvas
 CX, CY = W // 2, 262             # table centre
-FELT = '#0b3d2e'
-SPEEDS = {'Slow': 1100, 'Normal': 650, 'Fast': 250, 'Instant': 0}
+ROOM = '#0b3d2e'
+ROOM_RGB = (0x0b, 0x3d, 0x2e)
+FELT = ROOM
+TABLE_FELT_RGB = (0x1a, 0xbc, 0x9c)
+BASE_PAUSE = 850                 # ms a bot's action stays on screen at Normal speed
+SPEEDS = {'Slow': 1.6, 'Normal': 1.0, 'Fast': 0.45, 'Instant': 0.0}
+AVATARS = ['You', 'Hunter', 'AnteMax', 'Maniac', 'AnteTAG', 'Station', 'Nervous', 'Scared',
+           'Terrified', 'Nit', 'LAG', 'TAG', 'Exploit']
+CARD_WORD = {'A': 'Ace', 'K': 'King', 'Q': 'Queen', 'J': 'Jack', 'T': 'Ten', '9': 'Nine', '8': 'Eight',
+             '7': 'Seven', '6': 'Six', '5': 'Five', '4': 'Four', '3': 'Three', '2': 'Two'}
 BOT_INFO = {
     'Hunter': 'ante-aware TAG that reads opponents (isolates limpers, c-bets folders, value-bets stations)',
     'AnteMax': 'hyper-aggressive preflop (VPIP ~74 / PFR ~59), gives up postflop',
@@ -46,6 +55,10 @@ BOT_INFO = {
     'TAG': 'tight-aggressive regular (tuned for no-ante games)',
     'Exploit': 'TAG that adapts to your stats as it learns them',
 }
+
+
+def pretty(card):
+    return card[0].replace('T', '10') + {'s': '\u2660', 'h': '\u2665', 'd': '\u2666', 'c': '\u2663'}[card[1]]
 
 
 class QuitGame(Exception):
@@ -141,13 +154,13 @@ def _looks_right(img, w, h, rgb):
         return False
 
 
-def load_png(path, master, bg=(0, 0, 0)):
+def load_png(path, master, bg=(0, 0, 0), cards_only_flag=True):
     """Load a PNG as a Tk image on any Tk version.
 
     Returns (image or None, how it was loaded). None means every method failed and
     the caller should draw the card/table itself."""
     mode = os.environ.get('POKER_GUI_PNG', '')      # testing: decoder / put / blankppm / vector
-    if mode == 'vector' or '--draw-cards' in sys.argv:
+    if mode == 'vector' or ('--draw-cards' in sys.argv and cards_only_flag):
         return None, 'drawn as shapes (forced)'
     if not mode and tk.TkVersion >= 8.6:
         try:
@@ -191,8 +204,31 @@ def load_png(path, master, bg=(0, 0, 0)):
 SUIT_SYMBOL = {'s': '\u2660', 'h': '\u2665', 'd': '\u2666', 'c': '\u2663'}
 
 
+def short_hand(cards):
+    '''Hand name that fits a seat panel: "Pair of Kings", "Straight to K", "Two Pair K & 5".'''
+    v = evaluate(cards)
+    r = {14: 'A', 13: 'K', 12: 'Q', 11: 'J', 10: '10'}
+    rk = lambda x: r.get(x, str(x))
+    cat = v[0]
+    if cat == 1:
+        return describe(cards)
+    if cat == 2:
+        return 'Two Pair %s & %s' % (rk(v[1]), rk(v[2]))
+    return {0: '%s-high' % rk(v[1]), 3: 'Trips %ss' % rk(v[1]), 4: 'Straight to %s' % rk(v[1]),
+            5: 'Flush %s-high' % rk(v[1]), 6: 'Full House', 7: 'Quads %ss' % rk(v[1]),
+            8: 'Straight Flush'}[cat]
+
+
+def ease(t):
+    return 1 - (1 - t) ** 3
+
+
+def money(n):
+    return '{:,}'.format(int(round(n)))
+
+
 class HumanAgent:
-    '''The engine calls act(); we hand control to the GUI until a button is pressed.'''
+    '''The engine calls act(); we hand control to the GUI until a button or key is pressed.'''
 
     def __init__(self, app):
         self.app = app
@@ -205,137 +241,215 @@ class HumanAgent:
         pass
 
     def receive_cards(self, cards):
-        self.app.hero_cards = cards
+        self.app.on_deal(cards)
 
     def act(self, st):
         return self.app.ask_human(st)
 
 
 class PokerApp:
+    '''
+    One display state (self.disp), drawn in full by draw(); animations are temporary
+    sprites (tag "anim") moved on top of it, after which the new state is drawn.
+    '''
 
     def __init__(self, root):
         self.root = root
         root.title("Texas Hold'em vs Bots")
-        root.configure(bg=FELT)
+        root.configure(bg=ROOM)
         root.protocol('WM_DELETE_WINDOW', self.on_close)
         self.closing = False
         self.images = {}
         self.image_methods = {}
         self.session = None
         self.in_hand = False
+        self.dialog_open = False
+        self.hero_turn = False
+        self.cur = None
+        self.disp = None
         self.choice = tk.StringVar()
         self.pause_var = tk.IntVar()
         self.speed = tk.StringVar(value='Normal')
         self.auto_deal = tk.BooleanVar(value=False)
+        self.bankroll_shown = 0
         self.build_ui()
-        self.root.after(50, self.setup_dialog)
+        self.bind_keys()
+        self.bring_to_front()
+        self.root.after(80, self.setup_dialog)
 
-    # ------------------------------------------------------------------ images
+    # ================================================================ images
     def img(self, name):
-        '''Tk image for a card / 'back' / 'table', or None if it has to be drawn by hand.'''
+        '''Tk image for a card, 'back', 'table' or 'avatar:<Kind>[_dim]'; None = draw by hand.'''
         if name not in self.images:
-            path = {'back': 'card_back.png', 'table': 'table.png'}.get(name, 'deck/%s.png' % name)
-            # transparent pixels are blended onto what's behind: the room for the table,
-            # the table's felt for cards
-            bg = (0x0b, 0x3d, 0x2e) if name == 'table' else (0x1a, 0xbc, 0x9c)
-            img, how = load_png(os.path.join(RES, path), self.root, bg)
+            if name.startswith('avatar:'):
+                path = os.path.join('avatars', name[7:] + '.png')
+                bg = TABLE_FELT_RGB
+            else:
+                path = {'back': 'card_back.png', 'table': 'table.png'}.get(name, 'deck/%s.png' % name)
+                bg = ROOM_RGB if name == 'table' else TABLE_FELT_RGB
+            full = os.path.join(RES, path)
+            if os.path.exists(full):
+                # --draw-cards only swaps the cards for shapes; avatars still try images
+                img, how = load_png(full, self.root, bg, cards_only_flag=not name.startswith('avatar:'))
+            else:
+                img, how = None, 'missing'
             self.images[name] = img
             self.image_methods[how] = self.image_methods.get(how, 0) + 1
         return self.images[name]
 
-    def draw_card(self, x, y, card):
-        img = self.img(card)
-        if img is not None:
-            self.canvas.create_image(x, y, image=img)
+    def preload_images(self):
+        if self.image_methods:
             return
-        c = self.canvas
-        if card == 'back':
-            c.create_rectangle(x - 29, y - 43, x + 29, y + 43, fill='#c62828', outline='white', width=2)
-            c.create_rectangle(x - 22, y - 36, x + 22, y + 36, outline='#ffcdd2')
-            return
-        rank, suit = card[0], card[1]
-        colour = '#c62828' if suit in 'hd' else '#111111'
-        rank = '10' if rank == 'T' else rank
-        c.create_rectangle(x - 29, y - 43, x + 29, y + 43, fill='white', outline='#333', width=2)
-        c.create_text(x - 20, y - 30, text=rank, fill=colour, font=('Helvetica', 15, 'bold'))
-        c.create_text(x, y + 6, text=SUIT_SYMBOL[suit], fill=colour, font=('Helvetica', 30))
+        names = ['table', 'back'] + [r + s for r in '23456789TJQKA' for s in 'shdc']
+        names += ['avatar:%s%s' % (k, d) for k in AVATARS for d in ('', '_dim')]
+        for name in names:
+            self.img(name)
+        how = ', '.join('%s x%d' % kv for kv in sorted(self.image_methods.items()))
+        self.log('Images (Python %s, Tk %s): %s' % (sys.version.split()[0], tk.TkVersion, how), 'info')
+        if tk.TkVersion < 8.6 and '--draw-cards' not in sys.argv:
+            self.log('Old Tk: if cards are missing, restart with  --draw-cards  (or use a python.org Python)', 'info')
 
-    def draw_table(self):
-        img = self.img('table')
-        if img is not None:
-            self.canvas.create_image(CX, CY, image=img)
-            return
-        c = self.canvas
-        c.create_oval(CX - 400, CY - 206, CX + 400, CY + 206, fill='#17a589', outline='#0e6655', width=14)
-
-    # ---------------------------------------------------------------------- UI
+    # ============================================================== building
     def build_ui(self):
-        top = tk.Frame(self.root, bg=FELT)
-        top.pack(fill='x', padx=10, pady=(8, 0))
-        self.info = tk.Label(top, text='', fg='white', bg=FELT, font=('Helvetica', 14, 'bold'))
-        self.info.pack(side='left')
+        top = tk.Frame(self.root, bg=ROOM)
+        top.pack(fill='x', padx=12, pady=(8, 0))
+        self.hand_lbl = tk.Label(top, text='', fg='#cfd8dc', bg=ROOM, font=('Helvetica', 13, 'bold'))
+        self.hand_lbl.pack(side='left')
+        # the money counter
+        bank = tk.Frame(top, bg='#06261c', highlightbackground='#c9a227', highlightthickness=2)
+        bank.pack(side='left', padx=(24, 0))
+        tk.Label(bank, text='BANKROLL', fg='#c9a227', bg='#06261c',
+                 font=('Helvetica', 9, 'bold')).pack(side='left', padx=(10, 6))
+        self.bank_lbl = tk.Label(bank, text='0', fg='white', bg='#06261c', font=('Courier', 22, 'bold'), width=7,
+                                 anchor='e')
+        self.bank_lbl.pack(side='left')
+        self.delta_lbl = tk.Label(bank, text='', fg='#9e9e9e', bg='#06261c', font=('Helvetica', 12, 'bold'),
+                                  width=12, anchor='w')
+        self.delta_lbl.pack(side='left', padx=(8, 10))
+
         tk.Button(top, text='New session', command=self.setup_dialog).pack(side='right', padx=4)
-        tk.Checkbutton(top, text='Auto-deal', variable=self.auto_deal, bg=FELT, fg='white',
-                       selectcolor=FELT, activebackground=FELT).pack(side='right', padx=4)
+        tk.Checkbutton(top, text='Auto-deal', variable=self.auto_deal, bg=ROOM, fg='white',
+                       selectcolor=ROOM, activebackground=ROOM).pack(side='right', padx=4)
         ttk.Combobox(top, textvariable=self.speed, values=list(SPEEDS), width=8,
                      state='readonly').pack(side='right')
-        tk.Label(top, text='Bot speed:', fg='white', bg=FELT).pack(side='right', padx=(10, 2))
+        tk.Label(top, text='Speed:', fg='white', bg=ROOM).pack(side='right', padx=(10, 2))
 
-        self.canvas = tk.Canvas(self.root, width=W, height=H, bg=FELT, highlightthickness=0)
-        self.canvas.pack(padx=10)
+        self.canvas = tk.Canvas(self.root, width=W, height=H, bg=ROOM, highlightthickness=0)
+        self.canvas.pack(padx=10, pady=(6, 0))
+        self.canvas.bind('<Button-1>', lambda e: self.root.focus_set())
 
-        ctl = tk.Frame(self.root, bg=FELT)
-        ctl.pack(fill='x', padx=10, pady=4)
-        self.b_fold = tk.Button(ctl, text='Fold (F)', width=8, command=lambda: self.choose('fold'))
-        self.b_call = tk.Button(ctl, text='Check (C)', width=13, command=lambda: self.choose('call'))
-        self.b_raise = tk.Button(ctl, text='Raise (R)', width=21, command=lambda: self.choose('raise'))
+        # plain-English "what's happening" bar
+        self.status = tk.Label(self.root, text='', bg='#10372b', fg='white', font=('Helvetica', 15, 'bold'),
+                               anchor='w', padx=14, pady=6, wraplength=W - 20, justify='left')
+        self.status.pack(fill='x', padx=10, pady=(4, 0))
+        self.status_text = ''
+
+        ctl = tk.Frame(self.root, bg=ROOM)
+        ctl.pack(fill='x', padx=10, pady=6)
+        self.b_fold = tk.Button(ctl, text='Fold  [F]', width=8, command=lambda: self.choose('fold'))
+        self.b_call = tk.Button(ctl, text='Check  [C]', width=13, command=lambda: self.choose('call'))
+        self.b_raise = tk.Button(ctl, text='Raise  [R]', width=19, command=lambda: self.choose('raise'))
         self.amount = tk.IntVar(value=0)
-        self.scale = tk.Scale(ctl, from_=0, to=100, orient='horizontal', length=170, showvalue=False,
-                              variable=self.amount, bg=FELT, fg='white', highlightthickness=0,
+        self.scale = tk.Scale(ctl, from_=0, to=100, orient='horizontal', length=110, showvalue=False, takefocus=0,
+                              variable=self.amount, bg=ROOM, fg='white', highlightthickness=0,
                               command=lambda _v: self.update_raise_label())
-        self.entry = tk.Entry(ctl, width=7, textvariable=self.amount)
-        self.presets = [tk.Button(ctl, text=t, width=3 if len(t) < 3 else 5, command=lambda f=f: self.preset(f))
-                        for t, f in (('½', 0.5), ('⅔', 0.667), ('Pot', 1.0), ('All-in', None))]
-        self.b_next = tk.Button(ctl, text='Next hand ⏎', width=11, command=self.next_hand)
+        digits = (self.root.register(lambda p: p == '' or p.isdigit()), '%P')
+        self.entry = tk.Entry(ctl, width=7, textvariable=self.amount, validate='key', validatecommand=digits)
+        self.entry.bind('<Return>', lambda e: (self.choose('raise'), 'break')[1])
+        self.presets = [tk.Button(ctl, text='%s [%d]' % (t, i + 1), width=5, command=lambda f=f: self.preset(f))
+                        for i, (t, f) in enumerate((('½', 0.5), ('⅔', 0.667), ('Pot', 1.0), ('All-in', None)))]
+        self.b_next = tk.Button(ctl, text='Next hand [Enter]', width=14, command=self.next_hand)
         for w in (self.b_fold, self.b_call, self.b_raise, self.scale, self.entry, *self.presets):
-            w.pack(side='left', padx=3)
-        self.b_next.pack(side='right', padx=3)
+            w.pack(side='left', padx=2)
+        self.b_next.pack(side='right', padx=2)
 
-        log_frame = tk.Frame(self.root, bg=FELT)
+        log_frame = tk.Frame(self.root, bg=ROOM)
         log_frame.pack(fill='both', expand=True, padx=10, pady=(0, 10))
-        self.log_box = tk.Text(log_frame, height=8, bg='#0f2a22', fg='#e8e8e8', font=('Courier', 11),
+        self.log_box = tk.Text(log_frame, height=4, bg='#0f2a22', fg='#cfd8dc', font=('Courier', 11),
                                state='disabled', wrap='word')
+        for tag, colour in (('street', '#ffd54f'), ('hero', '#90caf9'), ('win', '#69f0ae'),
+                            ('info', '#78909c'), ('bot', '#e0e0e0')):
+            self.log_box.tag_configure(tag, foreground=colour)
         sb = tk.Scrollbar(log_frame, command=self.log_box.yview)
         self.log_box.configure(yscrollcommand=sb.set)
         self.log_box.pack(side='left', fill='both', expand=True)
         sb.pack(side='right', fill='y')
-
-        self.root.bind('<Key-f>', lambda e: self.key('fold'))
-        self.root.bind('<Key-c>', lambda e: self.key('call'))
-        self.root.bind('<Key-r>', lambda e: self.key('raise'))
-        self.root.bind('<Return>', lambda e: self.next_hand() if self.b_next['state'] == 'normal' else None)
         self.set_controls(False)
         self.b_next.configure(state='disabled')
 
-    def log(self, text):
+    def bind_keys(self):
+        # bind_all: works whichever widget has focus (buttons, slider, the amount box, ...)
+        self.root.bind_all('<KeyPress>', self.on_key)
+
+    def bring_to_front(self):
+        '''A Tk window started from Terminal on macOS doesn't get keyboard focus by itself.'''
+        try:
+            self.root.lift()
+            self.root.attributes('-topmost', True)
+            self.root.after(400, lambda: self.root.attributes('-topmost', False))
+            self.root.focus_force()
+        except tk.TclError:
+            pass
+
+    def on_key(self, e):
+        if self.dialog_open or self.session is None:
+            return
+        k = (e.keysym or '').lower()
+        if self.hero_turn:
+            if k == 'f':
+                self.press(self.b_fold, 'fold')
+            elif k in ('c', 'k', 'space'):
+                self.press(self.b_call, 'call')
+            elif k in ('r', 'b'):
+                self.press(self.b_raise, 'raise')
+            elif k in ('1', '2', '3', '4') and str(self.presets[0]['state']) == 'normal' \
+                    and not self.focus_in_entry():
+                self.preset((0.5, 0.667, 1.0, None)[int(k) - 1])
+            elif k in ('up', 'down') and str(self.b_raise['state']) == 'normal':
+                step = self.session.bb * (1 if k == 'up' else -1)
+                try:
+                    cur = int(self.amount.get())
+                except (tk.TclError, ValueError):
+                    cur = self.cur.min_raise_to
+                self.amount.set(max(self.cur.min_raise_to, min(self.cur.max_raise_to, cur + step)))
+                self.update_raise_label()
+        elif k in ('return', 'kp_enter', 'space', 'n') and str(self.b_next['state']) == 'normal':
+            self.root.after(0, self.next_hand)
+
+    def focus_in_entry(self):
+        try:
+            return self.root.focus_get() is self.entry
+        except (KeyError, tk.TclError):      # ttk popdown focus bug on some Pythons
+            return False
+
+    def press(self, button, what):
+        if str(button['state']) == 'normal':
+            self.choose(what)
+
+    def log(self, text, tag='bot'):
         self.log_box.configure(state='normal')
-        self.log_box.insert('end', text + '\n')
+        self.log_box.insert('end', text + '\n', tag)
         self.log_box.see('end')
         self.log_box.configure(state='disabled')
 
-    # ------------------------------------------------------------ setup dialog
+    def say(self, text, colour='white', bg='#10372b'):
+        self.status_text = text
+        self.status.configure(text=text, fg=colour, bg=bg)
+
+    # ========================================================= setup dialog
     def setup_dialog(self):
         if self.in_hand:
             messagebox.showinfo('Hand in progress', 'Finish the current hand first.')
             return
+        self.dialog_open = True
         d = tk.Toplevel(self.root)
         d.title('New session')
         d.transient(self.root)
-        d.grab_set()
+        d.protocol('WM_DELETE_WINDOW', lambda: (setattr(self, 'dialog_open', False), d.destroy()))
         tk.Label(d, text='Game', font=('Helvetica', 13, 'bold')).grid(row=0, column=0, sticky='w', padx=10, pady=(10, 2))
         struct = tk.StringVar(value='ante')
         for i, (k, v) in enumerate(STRUCTURES.items()):
-            tk.Radiobutton(d, text=v['label'], variable=struct, value=k).grid(row=1 + i, column=0, columnspan=3, sticky='w', padx=20)
+            tk.Radiobutton(d, text=v['label'], variable=struct, value=k).grid(row=1 + i, column=0, columnspan=4, sticky='w', padx=20)
         tk.Label(d, text='Buy-in (big blinds):').grid(row=3, column=0, sticky='w', padx=10)
         buy = tk.IntVar(value=100)
         tk.Spinbox(d, from_=20, to=500, increment=10, textvariable=buy, width=6).grid(row=3, column=1, sticky='w')
@@ -344,19 +458,29 @@ class PokerApp:
         kinds = [tk.StringVar(value=k) for k in DEFAULT_LINEUP + ['(empty)'] * (8 - len(DEFAULT_LINEUP))]
         for i, v in enumerate(kinds):
             tk.Label(d, text='Seat %d:' % (i + 2)).grid(row=5 + i, column=0, sticky='e', padx=(20, 4))
+            pic = tk.Label(d)
+            pic.grid(row=5 + i, column=1, padx=2)
             ttk.Combobox(d, textvariable=v, values=['(empty)'] + BOT_CHOICES, width=12,
-                         state='readonly').grid(row=5 + i, column=1, sticky='w')
-            info = tk.Label(d, text='', fg='#555', anchor='w', width=70)
-            info.grid(row=5 + i, column=2, sticky='w')
-            v.trace_add('write', lambda *_a, v=v, info=info: info.configure(text=BOT_INFO.get(v.get(), '')))
-            info.configure(text=BOT_INFO.get(v.get(), ''))
+                         state='readonly').grid(row=5 + i, column=2, sticky='w')
+            info = tk.Label(d, text='', fg='#555', anchor='w', width=64)
+            info.grid(row=5 + i, column=3, sticky='w')
+
+            def refresh(*_a, v=v, info=info, pic=pic):
+                info.configure(text=BOT_INFO.get(v.get(), ''))
+                img = self.small_avatar(v.get())
+                pic.configure(image=img if img is not None else '')
+                pic.image = img
+            v.trace_add('write', refresh)
+            refresh()
 
         styles = tk.BooleanVar(value=True)
         save = tk.BooleanVar(value=True)
         tk.Checkbutton(d, text='Show bot styles in their names (untick to practise reading them from the HUD)',
-                       variable=styles).grid(row=13, column=0, columnspan=3, sticky='w', padx=10, pady=(10, 0))
+                       variable=styles).grid(row=13, column=0, columnspan=4, sticky='w', padx=10, pady=(10, 0))
         tk.Checkbutton(d, text='Save my hands to history/ (1onmyraftpoker format, for sim.backtest)',
-                       variable=save).grid(row=14, column=0, columnspan=3, sticky='w', padx=10)
+                       variable=save).grid(row=14, column=0, columnspan=4, sticky='w', padx=10)
+        tk.Label(d, fg='#555', justify='left', text='Keys: F fold · C or Space check/call · R raise · 1-4 bet sizes '
+                 '· ↑/↓ adjust by 1 bb · Enter or Space next hand').grid(row=15, column=0, columnspan=4, sticky='w', padx=10)
 
         def start():
             lineup = [v.get() for v in kinds if v.get() != '(empty)']
@@ -369,166 +493,525 @@ class PokerApp:
             self.session = Session(lineup, structure=struct.get(), buy_in_bb=int(buy.get()),
                                    history_path=path, label_styles=styles.get())
             d.destroy()
+            self.dialog_open = False
             self.log_box.configure(state='normal')
             self.log_box.delete('1.0', 'end')
             self.log_box.configure(state='disabled')
-            self.log('New session: %s, %d bb buy-in. Opponents: %s' % (
-                STRUCTURES[struct.get()]['label'], int(buy.get()), ', '.join(s.name for s in self.session.seats[1:])))
+            self.log('New session: %s, %d bb buy-in.' % (STRUCTURES[struct.get()]['label'], int(buy.get())), 'info')
             if path:
-                self.log('Saving hands to %s' % os.path.relpath(path, HERE))
+                self.log('Saving hands to %s' % os.path.relpath(path, HERE), 'info')
             self.preload_images()
-            self.draw_idle()
+            self.bankroll_shown = self.session.human.stack
+            self.update_bankroll(animate=False)
+            self.reset_disp()
+            self.draw()
+            self.bring_to_front()
             self.b_next.configure(state='normal')
             self.next_hand()
 
-        tk.Button(d, text='Start', width=14, command=start).grid(row=15, column=0, columnspan=3, pady=12)
+        tk.Button(d, text='Start', width=14, command=start).grid(row=16, column=0, columnspan=4, pady=12)
         d.bind('<Return>', lambda e: start())
 
-    # ---------------------------------------------------------------- drawing
+    def small_avatar(self, kind):
+        if kind not in AVATARS:
+            return None
+        key = 'small:' + kind
+        if key not in self.images:
+            big = self.img('avatar:' + kind)
+            self.images[key] = big.subsample(2) if big is not None and hasattr(big, 'subsample') else None
+        return self.images[key]
+
+    # ================================================================ geometry
     def seat_xy(self, t, radius=1.0):
         n = len(self.session.seats)
         ang = math.radians(90 + 360 * t / n)
-        return CX + radius * 420 * math.cos(ang), CY + radius * 222 * math.sin(ang)
+        return CX + radius * 385 * math.cos(ang), CY + radius * 222 * math.sin(ang)
 
-    def draw(self, view):
-        '''view: dict with per-table-seat stacks, bets, folded, cards, labels, board, pot, actor, ...'''
+    def card_spot(self, t, k):
+        x, y = self.seat_xy(t, 0.63)
+        return x - 18 + 36 * k, y
+
+    def bet_spot(self, t):
+        x, y = self.seat_xy(t, 0.40)
+        return x, y
+
+    def board_spot(self, i):
+        return CX - 132 + 66 * i, CY - 22
+
+    POT = (CX, CY + 52)
+    DECK = (CX, CY - 22)
+
+    # ============================================================ disp state
+    def reset_disp(self):
+        s = self.session
+        n = len(s.seats)
+        self.disp = {
+            'stacks': [x.stack for x in s.seats], 'bets': [0] * n, 'folded': [False] * n,
+            'cards': {}, 'board': [], 'pot': 0, 'labels': {}, 'actor': None, 'winners': {},
+            'positions': s.positions(), 'hands': {}, 'highlight': set(), 'street': None,
+        }
+
+    def sync(self, st):
+        d = self.disp
+        for j, t in enumerate(self.order):
+            d['stacks'][t] = st.stacks[j]
+            d['bets'][t] = st.street_bets[j]
+            d['folded'][t] = st.folded[j]
+        d['pot'] = st.pot - sum(st.street_bets)
+        d['board'] = list(st.board)
+
+    # ================================================================ drawing
+    def draw(self):
         c = self.canvas
         c.delete('all')
+        d = self.disp
+        if d is None:
+            return
         self.draw_table()
-        s = self.session
-        bb = s.bb
-        # board and pot
-        board = view.get('board', [])
-        for i, card in enumerate(board):
-            self.draw_card(CX - 132 + 66 * i, CY - 18, card)
-        if view.get('pot') is not None:
-            c.create_text(CX, CY + 48, text='Pot %s' % self.fmt(view['pot']), fill='white',
-                          font=('Helvetica', 15, 'bold'))
-        if view.get('banner'):
-            c.create_text(CX, CY + 76, text=view['banner'], fill='#ffd54f', font=('Helvetica', 13, 'bold'))
-        pos = view.get('positions', {})
-        for t, seat in enumerate(s.seats):
-            x, y = self.seat_xy(t)
-            folded = view['folded'][t]
-            winner = view.get('winners', {}).get(t, 0) > 0
-            outline = '#ffd54f' if view.get('actor') == t else ('#66ff99' if winner else '#222')
-            fill = '#2b2b2b' if folded else ('#1e4d8c' if seat.is_human else '#3a3a3a')
-            c.create_rectangle(x - 80, y - 30, x + 80, y + 30, fill=fill, outline=outline, width=3)
-            c.create_text(x, y - 16, text=seat.name, fill='white', font=('Helvetica', 12, 'bold'))
-            c.create_text(x, y + 1, text='%s  (%.0f bb)' % (self.fmt(view['stacks'][t]), view['stacks'][t] / bb),
-                          fill='#dddddd', font=('Helvetica', 11))
-            lab = view.get('labels', {}).get(t, '')
-            c.create_text(x, y + 18, text=lab, fill='#ffd54f' if lab else '#888', font=('Helvetica', 11, 'italic'))
-            if pos.get(t):
-                tag = pos[t]
-                col = '#ffffff' if tag == 'BTN' else '#9ecbff'
-                c.create_oval(x + 62, y - 44, x + 92, y - 14, fill=col, outline='black')
-                c.create_text(x + 77, y - 29, text='D' if tag == 'BTN' else tag, font=('Helvetica', 9, 'bold'))
-            hud = s.hud(t) if not seat.is_human else ''
-            if hud:
-                c.create_text(x, y + 42, text=hud, fill='#c5e1a5', font=('Helvetica', 10))
-            # cards
-            cards = view['cards'].get(t)
-            if cards and not folded:
-                cx, cy = self.seat_xy(t, 0.70)
-                for k, card in enumerate(cards):
-                    self.draw_card(cx - 18 + 36 * k, cy, card)
-            # chips in front
-            bet = view['bets'][t]
-            if bet:
-                bx, by = self.seat_xy(t, 0.40)
-                bx -= 30
-                c.create_oval(bx - 9, by - 9, bx + 9, by + 9, fill='#e53935', outline='white', width=2)
-                c.create_text(bx + 14, by, text=self.fmt(bet), anchor='w', fill='white', font=('Helvetica', 11, 'bold'))
+        # deck
+        dx, dy = self.DECK
+        if not d['board']:
+            for k in range(3):
+                self.draw_card(dx - 2 * k, dy - 2 * k, 'back')
+        # board
+        for i, card in enumerate(d['board']):
+            x, y = self.board_spot(i)
+            self.draw_card(x, y, card)
+            if card in d['highlight']:
+                c.create_rectangle(x - 32, y - 46, x + 32, y + 46, outline='#ffd54f', width=4)
+        # pot
+        if d['pot']:
+            px, py = self.POT
+            self.draw_chips(px - 50, py, d['pot'], big=True)
+            c.create_text(px + 4, py, text='Pot  %s' % money(d['pot']), fill='white', anchor='w',
+                          font=('Helvetica', 16, 'bold'), tags='pot_text')
+        for t in range(len(self.session.seats)):
+            self.draw_seat(t)
         c.update_idletasks()
 
-    @staticmethod
-    def fmt(chips):
-        return '{:,}'.format(chips)
-
-    def draw_idle(self):
+    def draw_seat(self, t):
+        c = self.canvas
+        d = self.disp
         s = self.session
+        seat = s.seats[t]
+        x, y = self.seat_xy(t)
+        folded = d['folded'][t]
+        winner = d['winners'].get(t, 0) > 0
+        acting = d['actor'] == t
+        tag = 'seat%d' % t
+        # cards (behind the panel)
+        cards = d['cards'].get(t)
+        if cards and not folded:
+            for k, card in enumerate(cards):
+                cx_, cy_ = self.card_spot(t, k)
+                self.draw_card(cx_, cy_, card)
+                if card in d['highlight']:
+                    c.create_rectangle(cx_ - 31, cy_ - 45, cx_ + 31, cy_ + 45, outline='#ffd54f', width=3)
+        # panel
+        if acting:
+            c.create_rectangle(x - 106, y - 41, x + 106, y + 41, outline='#ffd54f', width=4)
+        outline = '#69f0ae' if winner else ('#ffd54f' if acting else '#11161a')
+        fill = '#262b2f' if folded else ('#1e4d8c' if seat.is_human else '#37474f')
+        c.create_rectangle(x - 100, y - 35, x + 100, y + 35, fill=fill, outline=outline, width=3, tags=tag)
+        av = self.img('avatar:%s%s' % (self.avatar_kind(seat), '_dim' if folded else ''))
+        if av is not None:
+            c.create_image(x - 64, y, image=av, tags=tag)
+        else:
+            c.create_oval(x - 98, y - 34, x - 30, y + 34, fill='#546e7a', outline='white', width=2, tags=tag)
+            c.create_text(x - 64, y, text=seat.name[:2], fill='white', font=('Helvetica', 16, 'bold'), tags=tag)
+        name_col = '#78909c' if folded else 'white'
+        c.create_text(x - 22, y - 20, text=seat.name, anchor='w', fill=name_col,
+                      font=('Helvetica', 12, 'bold'), tags=tag)
+        c.create_text(x - 22, y + 1, text=money(d['stacks'][t]), anchor='w', fill='#ffe082' if not folded else '#607d8b',
+                      font=('Courier', 15, 'bold'), tags=(tag, 'stack%d' % t))
+        lab = d['labels'].get(t)
+        if lab:
+            text, colour = lab
+            w = 7 * len(text) + 14
+            c.create_rectangle(x - 22, y + 13, x - 22 + w, y + 31, fill=colour, outline='', tags=tag)
+            c.create_text(x - 15, y + 22, text=text, anchor='w', fill='white' if colour != '#ffd54f' else '#222',
+                          font=('Helvetica', 10, 'bold'), tags=tag)
+        pos = d['positions'].get(t)
+        if pos:
+            col = '#ffffff' if pos == 'BTN' else '#9ecbff'
+            c.create_oval(x + 78, y - 47, x + 106, y - 19, fill=col, outline='black')
+            c.create_text(x + 92, y - 33, text='D' if pos == 'BTN' else pos, font=('Helvetica', 9, 'bold'))
+        hud = self.hud_words(t)
+        if hud:
+            c.create_text(x, y + 47, text=hud, fill='#a5d6a7', font=('Helvetica', 10), tags=tag)
+        # chips in front
+        bet = d['bets'][t]
+        if bet:
+            bx, by = self.bet_spot(t)
+            self.draw_chips(bx - 14, by, bet)
+            c.create_text(bx + 2, by, text=money(bet), anchor='w', fill='white', font=('Helvetica', 12, 'bold'))
+        c.tag_bind(tag, '<Enter>', lambda e, t=t: self.explain_seat(t))
+        c.tag_bind(tag, '<Leave>', lambda e: self.status.configure(text=self.status_text))
+
+    def avatar_kind(self, seat):
+        return 'You' if seat.is_human else (seat.kind if seat.kind in AVATARS else 'TAG')
+
+    def draw_chips(self, x, y, amount, big=False, tags=()):
+        '''A little stack of chips; more and pricier-looking chips for bigger amounts.'''
+        bb = self.session.bb
+        n = 1 if amount < 5 * bb else (2 if amount < 20 * bb else (3 if amount < 60 * bb else 4))
+        if big:
+            n += 1
+        colours = ['#e53935', '#1e88e5', '#43a047', '#212121', '#8e24aa']
+        r = 11 if big else 9
+        ids = []
+        for k in range(n):
+            col = colours[min(k, len(colours) - 1)]
+            ids.append(self.canvas.create_oval(x - r, y - r - 4 * k, x + r, y + r - 4 * k, fill=col,
+                                               outline='white', width=2, tags=tags))
+        return ids
+
+    def draw_card(self, x, y, card, tags=()):
+        img = self.img(card)
+        if img is not None:
+            return [self.canvas.create_image(x, y, image=img, tags=tags)]
+        c = self.canvas
+        if card == 'back':
+            return [c.create_rectangle(x - 29, y - 43, x + 29, y + 43, fill='#c62828', outline='white', width=2, tags=tags),
+                    c.create_rectangle(x - 22, y - 36, x + 22, y + 36, outline='#ffcdd2', tags=tags)]
+        rank, suit = card[0], card[1]
+        colour = '#c62828' if suit in 'hd' else '#111111'
+        rank = '10' if rank == 'T' else rank
+        return [c.create_rectangle(x - 29, y - 43, x + 29, y + 43, fill='white', outline='#333', width=2, tags=tags),
+                c.create_text(x - 20, y - 30, text=rank, fill=colour, font=('Helvetica', 15, 'bold'), tags=tags),
+                c.create_text(x, y + 6, text=SUIT_SYMBOL[suit], fill=colour, font=('Helvetica', 30), tags=tags)]
+
+    def draw_table(self):
+        img = self.img('table')
+        if img is not None:
+            self.canvas.create_image(CX, CY, image=img)
+            return
+        self.canvas.create_oval(CX - 400, CY - 206, CX + 400, CY + 206, fill='#17a589', outline='#0e6655', width=14)
+
+    # ========================================================== explanations
+    def hud_words(self, t):
+        s = self.session
+        if s.seats[t].is_human:
+            return ''
+        p = s.tracker.players.get(s.seats[t].name)
+        if not p or p.hands < 1:
+            return ''
+        if p.hands < 8:
+            return 'reading... (%d hand%s)' % (p.hands, '' if p.hands == 1 else 's')
+        return 'plays %d%% · raises %d%%' % (round(100 * p.rate('vpip', shrink=False)),
+                                             round(100 * p.rate('pfr', shrink=False)))
+
+    def explain_seat(self, t):
+        s = self.session
+        seat = s.seats[t]
+        if seat.is_human:
+            text = 'You: %s chips. Session %+.1f bb.' % (money(seat.stack), seat.won / s.bb)
+        else:
+            p = s.tracker.players.get(seat.name)
+            style = BOT_INFO.get(seat.kind, '')
+            if p and p.hands:
+                pct = lambda k: '%d%%' % round(100 * p.rate(k, shrink=False)) if p.stats[k].opp else '-'
+                text = ('%s: plays %s of hands, raises %s preflop, 3-bets %s, folds to c-bets %s, aggression %.1f '
+                        '(%d hands)' % (seat.name, pct('vpip'), pct('pfr'), pct('three_bet'), pct('fold_cbet'),
+                                        p.af(), p.hands))
+            else:
+                text = '%s: no hands seen yet' % seat.name
+            if style and not seat.name.startswith('Bot '):
+                text += '  —  ' + style
+        self.status.configure(text=text)
+
+    def hand_help(self, st):
+        '''Plain-English description of the hero's spot.'''
+        hole = st.hole
+        if not st.board:
+            code = hand_code(hole)
+            top = 100 * PF_PERCENTILE[code]
+            what = '%s %s (%s): top %d%% of starting hands' % (CARD_WORD[hole[0][0]], CARD_WORD[hole[1][0]],
+                                                              'suited' if code.endswith('s') else
+                                                              ('pair' if len(code) == 2 else 'offsuit'), max(1, round(top)))
+        else:
+            what = 'You have %s' % describe(hole + st.board)
+            if len(st.board) < 5:
+                fd, oe, gs = _draws(hole, st.board)
+                extra = [n for n, f in (('flush draw', fd), ('open-ended straight draw', oe), ('gutshot', gs)) if f]
+                if extra:
+                    what += ' + ' + ' + '.join(extra)
+        if st.to_call:
+            need = 100.0 * st.to_call / (st.pot + st.to_call)
+            return ('Your turn: %s to call into a %s pot (calling needs to win %d%% of the time). %s.' %
+                    (money(st.to_call), money(st.pot), round(need), what))
+        return 'Your turn: nobody has bet — check or bet. Pot %s. %s.' % (money(st.pot), what)
+
+    # ============================================================ animation
+    def k(self):
+        base = SPEEDS[self.speed.get()]
+        if self.in_hand and self.disp and self.disp['folded'][0]:
+            return base * 0.35          # you're out of the hand: fast-forward the rest
+        return base
+
+    def sleep(self, ms):
+        if self.closing:
+            raise QuitGame
+        if ms <= 0:
+            return
+        self.root.after(int(ms), lambda: self.pause_var.set(self.pause_var.get() + 1))
+        self.root.wait_variable(self.pause_var)
+        if self.closing:
+            raise QuitGame
+
+    def frames(self, ms, step):
+        '''Run step(progress 0..1, eased) over ~ms * speed milliseconds.'''
+        dur = ms * self.k()
+        if dur <= 0:
+            step(1.0)
+            return
+        n = max(2, int(dur / 18))
+        for i in range(1, n + 1):
+            step(ease(i / n))
+            self.canvas.update_idletasks()
+            self.sleep(dur / n)
+
+    def fly(self, items, start, end, ms=320):
+        '''Move canvas items from start to end (both (x, y)), easing out.'''
+        last = [0.0]
+
+        def step(p):
+            dx = (end[0] - start[0]) * (p - last[0])
+            dy = (end[1] - start[1]) * (p - last[0])
+            for it in items:
+                self.canvas.move(it, dx, dy)
+            last[0] = p
+        self.frames(ms, step)
+
+    def float_text(self, x, y, text, colour):
+        item = self.canvas.create_text(x, y, text=text, fill=colour, font=('Helvetica', 20, 'bold'), tags='anim')
+        self.frames(700, lambda p: self.canvas.coords(item, x, y - 40 * p))
+        self.canvas.delete(item)
+
+    def banner(self, text, ms=650):
+        if self.k() <= 0:
+            return
+        c = self.canvas
+        box = c.create_rectangle(CX - 130, CY - 96, CX + 130, CY - 58, fill='#000000', outline='#ffd54f',
+                                 width=2, tags='anim')
+        lab = c.create_text(CX, CY - 77, text=text, fill='#ffd54f', font=('Helvetica', 20, 'bold'), tags='anim')
+        c.update_idletasks()
+        self.sleep(ms * self.k())
+        c.delete(box)
+        c.delete(lab)
+
+    def chips_fly(self, t_from, to_xy, amount, ms=300, from_xy=None):
+        x0, y0 = from_xy or self.seat_xy(t_from, 0.85)
+        ids = self.draw_chips(x0, y0, amount, tags='anim')
+        self.fly(ids, (x0, y0), to_xy, ms)
+        return ids
+
+    def sweep_bets(self):
+        '''Slide every bet into the pot.'''
+        d = self.disp
+        total = sum(d['bets'])
+        if not total:
+            return
+        spots = [(self.bet_spot(t)[0] - 14, self.bet_spot(t)[1], amt) for t, amt in enumerate(d['bets']) if amt]
+        start_pot = d['pot']
+        d['bets'] = [0] * len(d['bets'])
+        if self.k() > 0:
+            self.draw()
+            sprites = [(self.draw_chips(x, y, amt, tags='anim'), (x, y)) for x, y, amt in spots]
+            tx, ty = self.POT[0] - 50, self.POT[1]
+            last = [0.0]
+
+            def step(p):
+                for ids, (x0, y0) in sprites:
+                    for i in ids:
+                        self.canvas.move(i, (tx - x0) * (p - last[0]), (ty - y0) * (p - last[0]))
+                last[0] = p
+                self.canvas.itemconfigure('pot_text', text='Pot  %s' % money(start_pot + total * p))
+            self.frames(380, step)
+            self.canvas.delete('anim')
+        d['pot'] = start_pot + total
+        self.draw()
+
+    def tween_stack(self, t, start, end, ms=350):
+        self.frames(ms, lambda p: self.canvas.itemconfigure('stack%d' % t, text=money(start + (end - start) * p)))
+
+    def update_bankroll(self, animate=True):
+        s = self.session
+        new = s.human.stack
+        old = self.bankroll_shown
+        net_bb = s.human.won / s.bb
+        arrow = '▲' if net_bb > 0 else ('▼' if net_bb < 0 else '•')
+        colour = '#69f0ae' if net_bb > 0 else ('#ff5252' if net_bb < 0 else '#9e9e9e')
+        self.delta_lbl.configure(text='%s %+.1f bb' % (arrow, net_bb), fg=colour)
+        if animate and new != old and self.k() > 0:
+            flash = '#69f0ae' if new > old else '#ff5252'
+            self.bank_lbl.configure(fg=flash)
+            self.frames(900, lambda p: self.bank_lbl.configure(text=money(old + (new - old) * p)))
+            self.sleep(200)
+        self.bank_lbl.configure(text=money(new), fg='white')
+        self.bankroll_shown = new
+        self.hand_lbl.configure(text='Hand %d' % max(1, s.hand_no))
+
+    # ======================================================= engine -> GUI
+    def on_deal(self, hero_cards):
+        '''Called by the engine right after dealing: animate antes, blinds and the deal.'''
+        s = self.session
+        d = self.disp
         n = len(s.seats)
-        pos = s.positions()
-        self.draw({'stacks': [x.stack for x in s.seats], 'bets': [0] * n, 'folded': [False] * n,
-                   'cards': {}, 'positions': pos, 'pot': None, 'labels': {}})
-        self.update_info()
+        struct = s.struct
+        self.say('Hand %d — %s has the button. Antes and blinds go in, cards are dealt.' % (
+            s.hand_no, s.seats[s.button].name), '#ffe082')
+        # antes
+        if struct['ante']:
+            sources = []
+            for t in range(n):
+                amt = min(struct['ante'], d['stacks'][t])
+                d['stacks'][t] -= amt
+                d['pot'] += amt
+                sources.append(self.seat_xy(t, 0.85))
+            self.draw()
+            if self.k() > 0:
+                sprites = [(self.draw_chips(x, y, 1, tags='anim'), (x, y)) for x, y in sources]
+                tx, ty = self.POT[0] - 50, self.POT[1]
+                last = [0.0]
 
-    def update_info(self):
-        s = self.session
-        hu = s.human
-        net = hu.won
-        self.info.configure(text='Hand %d   |   You: %s chips, %+.1f bb this session (%d buy-in%s)' % (
-            s.hand_no, '{:,}'.format(hu.stack), net / s.bb, hu.buyins, '' if hu.buyins == 1 else 's'))
-
-    # ---------------------------------------------------- engine <-> GUI glue
-    def start_view(self):
-        s = self.session
-        n = len(s.seats)
-        self.order = [(s.button + j) % n for j in range(n)]
-        self.pos = s.positions()
-        self.labels = {}
-        self.street = PREFLOP
-        self.hero_cards = None
-
-    def view_from(self, st, actor=None):
-        n = len(self.session.seats)
-        stacks, bets, folded = [0] * n, [0] * n, [False] * n
-        cards = {}
-        for j, t in enumerate(self.order):
-            stacks[t] = st.stacks[j]
-            bets[t] = st.street_bets[j]
-            folded[t] = st.folded[j]
-            cards[t] = self.hero_cards if t == 0 else ['back', 'back']
-        if st.street != self.street:
-            self.street = st.street
-            self.labels = {}
-            self.log('--- %s: %s' % (st.street.upper(), ' '.join(st.board)))
-        pot = st.pot - sum(st.street_bets)
-        return {'stacks': stacks, 'bets': bets, 'folded': folded, 'cards': cards, 'board': st.board,
-                'pot': pot, 'positions': self.pos, 'labels': self.labels, 'actor': actor}
+                def step(p):
+                    for ids, (x0, y0) in sprites:
+                        for i in ids:
+                            self.canvas.move(i, (tx - x0) * (p - last[0]), (ty - y0) * (p - last[0]))
+                    last[0] = p
+                self.frames(350, step)
+                self.canvas.delete('anim')
+                self.draw()
+        # blinds
+        sb_t = self.order[0] if n == 2 else self.order[1]
+        bb_t = self.order[1] if n == 2 else self.order[2]
+        for t, amt in ((sb_t, struct['small_blind']), (bb_t, struct['big_blind'])):
+            amt = min(amt, d['stacks'][t])
+            d['stacks'][t] -= amt
+            d['bets'][t] += amt
+            d['labels'][t] = ('SB %s' % money(amt) if t == sb_t else 'BB %s' % money(amt), '#455a64')
+        self.draw()
+        # deal: two rounds, starting left of the button
+        dealt = {}
+        for rnd in range(2):
+            for j in range(1, n + 1):
+                t = self.order[j % n]
+                if self.k() > 0:
+                    ids = self.draw_card(*self.DECK, 'back', tags='anim')
+                    self.fly(ids, self.DECK, self.card_spot(t, rnd), 140)
+                dealt.setdefault(t, []).append('back')
+                d['cards'][t] = list(dealt[t])
+        self.canvas.delete('anim')
+        d['cards'][0] = list(hero_cards)          # flip ours
+        self.draw()
+        self.log('You are dealt %s %s' % tuple(pretty(c) for c in hero_cards), 'hero')
 
     def before_action(self, t, st):
         if self.closing:
             raise QuitGame
-        self.draw(self.view_from(st, actor=t))
-        self.update_info()
+        d = self.disp
+        if st.street != d['street']:
+            if d['street'] is not None:
+                self.new_street(st)
+            d['street'] = st.street
+            d['labels'] = {k: v for k, v in d['labels'].items() if v[0] == 'Fold'}
+        self.sync(st)
+        d['actor'] = t
+        self.draw()
+        if t != 0:
+            seat = self.session.seats[t]
+            self.say('%s is thinking...' % seat.name, '#cfd8dc')
+            self.think(t, 0.45 * BASE_PAUSE * self.k())
+
+    def think(self, t, ms):
+        '''Pulsing dots in the acting bot's panel.'''
+        if ms <= 0:
+            return
+        x, y = self.seat_xy(t)
+        item = self.canvas.create_text(x + 60, y - 20, text='', fill='#ffd54f', font=('Helvetica', 16, 'bold'),
+                                       tags='anim')
+        steps = max(1, int(ms / 150))
+        for i in range(steps):
+            self.canvas.itemconfigure(item, text='.' * (1 + i % 3))
+            self.canvas.update_idletasks()
+            self.sleep(ms / steps)
+        self.canvas.delete(item)
+
+    def new_street(self, st):
+        d = self.disp
+        self.sweep_bets()
+        name = {'flop': 'FLOP', 'turn': 'TURN', 'river': 'RIVER'}[st.street]
+        new = st.board[len(d['board']):]
+        self.log('--- %s: %s' % (name, ' '.join(pretty(c) for c in st.board)), 'street')
+        self.say('%s: %s   —   pot %s' % (name.title(), ' '.join(pretty(c) for c in st.board), money(d['pot'])),
+                 '#ffd54f')
+        self.banner(name)
+        self.deal_board(new)
+
+    def deal_board(self, cards):
+        d = self.disp
+        for card in cards:
+            i = len(d['board'])
+            if self.k() > 0:
+                ids = self.draw_card(*self.DECK, 'back', tags='anim')
+                self.fly(ids, (self.DECK[0] + 200, self.DECK[1]), self.board_spot(i), 260)
+                self.canvas.delete('anim')
+            d['board'].append(card)
+            self.draw()
+            self.sleep(120 * self.k())
 
     def after_action(self, t, st, a):
-        name = self.session.seats[t].name
+        d = self.disp
+        s = self.session
+        name = s.seats[t].name
+        d['actor'] = None
         if a.kind == FOLD:
-            txt, lab = 'folds', 'Fold'
+            txt, pill = 'folds', ('Fold', '#616161')
+            if self.k() > 0 and d['cards'].get(t):
+                ids = []
+                for k_ in range(2):
+                    ids += self.draw_card(*self.card_spot(t, k_), 'back', tags='anim')
+                self.fly(ids, self.card_spot(t, 0), self.DECK, 260)
+                self.canvas.delete('anim')
+            d['folded'][t] = True
         elif a.kind == CHECK:
-            txt, lab = 'checks', 'Check'
-        elif a.kind == CALL:
-            txt, lab = 'calls %s' % self.fmt(st.to_call), 'Call %s' % self.fmt(st.to_call)
-        elif a.kind == BET:
-            txt, lab = 'bets %s' % self.fmt(a.amount), 'Bet %s' % self.fmt(a.amount)
+            txt, pill = 'checks', ('Check', '#1565c0')
         else:
-            txt, lab = 'raises to %s' % self.fmt(a.amount), 'Raise to %s' % self.fmt(a.amount)
-        if (a.kind in (BET, RAISE) and a.amount >= st.max_raise_to) or \
-                (a.kind == CALL and st.to_call >= st.stack):
-            lab += ' (all-in)'
-        self.labels[t] = lab
-        self.log('%-14s %s' % (name, txt))
+            if a.kind == CALL:
+                added = st.to_call
+                txt, pill = 'calls %s' % money(added), ('Call %s' % money(added), '#2e7d32')
+            else:
+                added = a.amount - st.committed
+                verb = 'bets' if a.kind == BET else 'raises to'
+                txt = '%s %s' % (verb, money(a.amount))
+                pill = ('%s %s' % ('Bet' if a.kind == BET else 'Raise to', money(a.amount)), '#c62828')
+            if added >= st.stack:
+                txt += ' (ALL-IN)'
+                pill = ('ALL-IN %s' % money(st.committed + added), '#ff6f00')
+            start = d['stacks'][t]
+            if self.k() > 0:
+                self.chips_fly(t, (self.bet_spot(t)[0] - 14, self.bet_spot(t)[1]), added, 280)
+                self.tween_stack(t, start, start - added, 200)
+                self.canvas.delete('anim')
+            d['stacks'][t] = start - added
+            d['bets'][t] += added
+        d['labels'][t] = pill
+        self.draw()
+        line = '%s %s' % (name, txt)
+        self.log('%-14s %s' % (name, txt), 'hero' if t == 0 else 'bot')
         if t != 0:
-            self.pause(SPEEDS[self.speed.get()])
-
-    def pause(self, ms):
-        if ms <= 0 or self.closing:
-            return
-        self.root.after(ms, lambda: self.pause_var.set(self.pause_var.get() + 1))
-        self.root.wait_variable(self.pause_var)
+            self.say(line, '#ffffff')
+            self.sleep(0.55 * BASE_PAUSE * self.k())
 
     def ask_human(self, st):
-        self.hero_cards = st.hole
-        view = self.view_from(st, actor=0)
-        self.draw(view)
         self.cur = st
+        self.hero_turn = True
         legal = st.legal()
+        self.say(self.hand_help(st), '#ffffff', '#1e4d8c')
         self.set_controls(True)
         self.b_fold.configure(state='normal' if FOLD in legal else 'disabled')
-        self.b_call.configure(text=('Call %s (C)' % self.fmt(st.to_call)) if st.to_call else 'Check (C)')
+        self.b_call.configure(text=('Call %s  [C]' % money(st.to_call)) if st.to_call else 'Check  [C]')
         can_raise = BET in legal or RAISE in legal
         for w in (self.b_raise, self.scale, self.entry, *self.presets):
             w.configure(state='normal' if can_raise else 'disabled')
@@ -536,8 +1019,11 @@ class PokerApp:
             self.scale.configure(from_=st.min_raise_to, to=st.max_raise_to)
             self.amount.set(min(st.max_raise_to, max(st.min_raise_to, self.preset_amount(0.667))))
             self.update_raise_label()
+        else:
+            self.b_raise.configure(text='Raise  [R]')
         self.choice.set('')
         self.root.wait_variable(self.choice)
+        self.hero_turn = False
         self.set_controls(False)
         if self.closing:
             raise QuitGame
@@ -553,7 +1039,7 @@ class PokerApp:
         return Action(RAISE if st.current_bet else BET, max(st.min_raise_to, min(amt, st.max_raise_to)))
 
     def preset_amount(self, frac):
-        st = self.cur if hasattr(self, 'cur') else None
+        st = self.cur
         if st is None:
             return 0
         if frac is None:
@@ -568,7 +1054,7 @@ class PokerApp:
         self.update_raise_label()
 
     def update_raise_label(self):
-        st = getattr(self, 'cur', None)
+        st = self.cur
         if st is None:
             return
         try:
@@ -576,8 +1062,8 @@ class PokerApp:
         except (tk.TclError, ValueError):
             return
         verb = 'Raise to' if st.current_bet else 'Bet'
-        allin = ' (all-in)' if amt >= st.max_raise_to else ''
-        self.b_raise.configure(text='%s %s%s (R)' % (verb, self.fmt(amt), allin))
+        allin = ' ALL-IN' if amt >= st.max_raise_to else ''
+        self.b_raise.configure(text='%s %s%s  [R]' % (verb, money(amt), allin))
 
     def set_controls(self, on):
         for w in (self.b_fold, self.b_call, self.b_raise, self.scale, self.entry, *self.presets):
@@ -586,87 +1072,113 @@ class PokerApp:
     def choose(self, what):
         self.choice.set(what)
 
-    def key(self, what):
-        widget = {'fold': self.b_fold, 'call': self.b_call, 'raise': self.b_raise}[what]
-        if str(widget['state']) == 'normal' and not isinstance(self.root.focus_get(), tk.Entry):
-            self.choose(what)
-
-    # --------------------------------------------------------------- the hand
+    # ================================================================ hands
     def next_hand(self):
-        if self.in_hand or self.session is None:
+        if self.in_hand or self.session is None or self.dialog_open:
             return
         self.in_hand = True
         self.b_next.configure(state='disabled')
-        self.start_view()
         s = self.session
-        self.log('\n=== Hand %d   (button: %s)' % (s.hand_no + 1, s.seats[s.button].name))
+        for t in s.rebuy_busted():
+            self.log('%s rebuys for %s' % (s.seats[t].name, money(s.buy_in)), 'info')
+        n = len(s.seats)
+        self.order = [(s.button + j) % n for j in range(n)]
+        self.reset_disp()
+        self.draw()
+        self.log('\n=== Hand %d   (button: %s)' % (s.hand_no + 1, s.seats[s.button].name), 'street')
+        self.hand_lbl.configure(text='Hand %d' % (s.hand_no + 1))
         try:
             res = s.play_hand(HumanAgent(self), observer=self)
-        except QuitGame:
+            self.show_result(res)
+        except (QuitGame, tk.TclError):
             return
         finally:
             self.in_hand = False
-        self.show_result(res)
         if self.closing:
             return
         self.b_next.configure(state='normal')
         if self.auto_deal.get():
-            self.root.after(2500, self.next_hand)
+            self.root.after(int(1500 + 1500 * self.k()), self.next_hand)
 
     def show_result(self, res):
         s = self.session
         h = res.history
-        n = len(s.seats)
-        stacks = [x.stack for x in s.seats]
-        cards, folded = {}, [True] * n
-        for j, t in enumerate(res.order):
-            if j in h.showdown:
-                cards[t] = h.hole[j]
-                folded[t] = False
-            elif t == 0:
-                cards[t] = h.hole[j]
-                folded[t] = False
-        alive = {res.order[j] for j in range(n)} - {res.order[a.seat] for a in h.actions if a.kind == FOLD}
-        for t in alive:
-            folded[t] = False
-            cards.setdefault(t, ['back', 'back'])
-        labels = {}
-        for j in h.showdown:
-            t = res.order[j]
-            labels[t] = HAND_NAMES[evaluate(h.hole[j] + h.board)[0]]
-        winners = {t: v for t, v in res.net.items() if v > 0}
-        banner = ', '.join('%s wins %s' % (s.seats[t].name, self.fmt(v + h.invested[res.order.index(t)]))
-                           for t, v in winners.items())
-        self.draw({'stacks': stacks, 'bets': [0] * n, 'folded': folded, 'cards': cards, 'board': h.board,
-                   'pot': sum(h.invested), 'positions': self.pos, 'labels': labels, 'winners': winners,
-                   'banner': banner})
-        if h.board and self.street != 'river' and len(h.board) == 5:
-            self.log('--- board: %s' % ' '.join(h.board))
-        for j in h.showdown:
-            t = res.order[j]
-            self.log('%-14s shows %s (%s)' % (s.seats[t].name, ' '.join(h.hole[j]), labels[t]))
-        self.log(banner or 'Pot returned')
+        d = self.disp
+        d['actor'] = None
+        board_before = len(d['board'])
+        self.sweep_bets()
+        # all-in before the river: run the board out with a little suspense
+        if h.showdown and len(h.board) > board_before:
+            self.say('All-in! Running out the board...', '#ff6f00')
+            for j in h.showdown:
+                d['cards'][res.order[j]] = list(h.hole[j])
+            self.draw()
+            self.sleep(500 * self.k())
+            for i in range(board_before, len(h.board)):
+                self.deal_board([h.board[i]])
+                self.sleep(350 * self.k())
+        # reveal showdown hands
+        if h.showdown:
+            for j in h.showdown:
+                t = res.order[j]
+                d['cards'][t] = list(h.hole[j])
+                d['labels'][t] = (short_hand(h.hole[j] + h.board), '#4e342e')
+                self.draw()
+                self.log('%-14s shows %s %s  (%s)' % (s.seats[t].name, pretty(h.hole[j][0]), pretty(h.hole[j][1]),
+                                                      describe(h.hole[j] + h.board)),
+                         'hero' if t == 0 else 'bot')
+                self.sleep(380 * self.k())
+        # pay each pot
+        total_won = {}
+        for award in h.pot_awards:
+            for j, amt in award:
+                total_won[res.order[j]] = total_won.get(res.order[j], 0) + amt
+        winners = {t: amt for t, amt in total_won.items() if amt}
+        if winners:
+            best_t = max(winners, key=winners.get)
+            if h.showdown:
+                j = res.order.index(best_t)
+                five = best_five(h.hole[j] + h.board)
+                d['highlight'] = set(five)
+            for t, amt in sorted(winners.items()):
+                d['winners'][t] = amt
+                start = d['stacks'][t]
+                self.draw()
+                if self.k() > 0:
+                    x, y = self.seat_xy(t, 0.85)
+                    self.chips_fly(None, (x, y), amt, 450, from_xy=(self.POT[0] - 50, self.POT[1]))
+                    self.canvas.delete('anim')
+                d['pot'] = max(0, d['pot'] - amt)
+                self.draw()
+                self.tween_stack(t, start, start + amt, 450)
+                d['stacks'][t] = start + amt
+                if self.k() > 0:
+                    x, y = self.seat_xy(t)
+                    self.float_text(x, y - 50, '+%s' % money(amt), '#69f0ae')
+            # final message
+            parts = []
+            for t, amt in winners.items():
+                name = s.seats[t].name
+                j = res.order.index(t)
+                how = ('with %s' % describe(h.hole[j] + h.board)) if h.showdown else '— everyone else folded'
+                parts.append('%s %s %s %s' % (name, 'win' if t == 0 else 'wins', money(amt), how))
+            msg = '   |   '.join(parts)
+            me_won = 0 in winners
+            self.say(msg, '#69f0ae' if me_won else '#ffffff', '#1b5e20' if me_won else '#37474f')
+            self.log(msg, 'win')
+        d['pot'] = 0
+        d['stacks'] = [x.stack for x in s.seats]
+        self.draw()
         me = res.net.get(0, 0)
-        self.log('You: %+d chips (%+.1f bb) this hand' % (me, me / s.bb))
-        self.update_info()
+        if me:
+            self.log('You: %+d chips (%+.1f bb) this hand' % (me, me / s.bb), 'hero')
+        self.update_bankroll()
 
     def on_close(self):
         self.closing = True
         self.choice.set('quit')
         self.pause_var.set(self.pause_var.get() + 1)
         self.root.after(10, self.root.destroy)
-
-
-    def preload_images(self):
-        '''Load every image up front (so any slow fallback happens once) and report how.'''
-        if self.image_methods:
-            return
-        for name in ['table', 'back'] + [r + s for r in '23456789TJQKA' for s in 'shdc']:
-            self.img(name)
-        how = ', '.join('%s x%d' % kv for kv in sorted(self.image_methods.items()))
-        self.log('Images (Python %s, Tk %s): %s' % (sys.version.split()[0], tk.TkVersion, how))
-        if tk.TkVersion < 8.6 and '--draw-cards' not in sys.argv:
-            self.log('Old Tk: if cards are missing, restart with  --draw-cards  (or use a python.org Python)')
 
 
 def diagnose():
