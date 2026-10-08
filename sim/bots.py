@@ -149,7 +149,7 @@ class ParamBot(Bot):
     def value_size(self, st, p):
         return p.bet_size
 
-    def strength(self, st, p):
+    def hand_strength(self, st, p):
         '''(strength, multiway-adjusted strength) for postflop decisions.'''
         if p.smart:
             if getattr(self, '_ranges', None) is None:
@@ -228,7 +228,7 @@ class ParamBot(Bot):
 
     # --------------------------------------------------------------- postflop
     def _postflop(self, st, p):
-        s, s_adj = self.strength(st, p)
+        s, s_adj = self.hand_strength(st, p)
         pot = st.pot
         is_pfa = st.preflop_aggressor == st.seat
 
@@ -519,7 +519,7 @@ class Hunter(ExploitBot):
         opp = self._opp(st, others[0])
         read = self._read(opp)
         passive = opp.rate('afq', k=20) < 0.30
-        s, _ = self.strength(st, p)
+        s, _ = self.hand_strength(st, p)
         pot = st.pot
         is_pfa = st.preflop_aggressor == st.seat
         prev = {FLOP: PREFLOP, 'turn': FLOP, 'river': 'turn'}[st.street]

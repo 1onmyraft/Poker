@@ -18,12 +18,19 @@ CATEGORY_NAMES = ['high card', 'one pair', 'two pairs', 'three of a kind', 'stra
                   'flush', 'full house', 'four of a kind', 'straight flush']
 
 
+# (top card, bitmask of the five ranks) for every straight, best first; the ace also plays low
+_STRAIGHTS = [(top, sum(1 << (top - k) for k in range(5))) for top in range(14, 4, -1)]
+
+
 def _straight_high(rank_set):
-    '''Highest straight top card in a set of rank values, or 0.'''
-    if 14 in rank_set:
-        rank_set = rank_set | {1}
-    for top in range(14, 4, -1):
-        if all((top - k) in rank_set for k in range(5)):
+    """Highest straight top card in a set of rank values, or 0."""
+    m = 0
+    for r in rank_set:
+        m |= 1 << r
+    if m & (1 << 14):
+        m |= 2                      # ace counts as 1 for the wheel
+    for top, mask in _STRAIGHTS:
+        if m & mask == mask:
             return top
     return 0
 

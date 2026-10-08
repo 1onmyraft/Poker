@@ -124,10 +124,22 @@ def equity(hole, board, ranges, samples=300, rng=None):
 
 # ----------------------------------------------------------------------------- tracking
 
-def _combo_strength(combo, board):
-    '''How strong a combo is on this board, 0..1 (made hand class plus draws, cheap).'''
-    from .strength import postflop_strength
-    return postflop_strength(list(combo), list(board))
+_STRENGTH = {}          # board -> {combo index: strength}, shared by every tracker and bot
+
+
+def _combo_strength(i, board):
+    '''How strong combo i is on this board, 0..1 (made hand class plus draws), cached per board.'''
+    key = tuple(board)
+    cache = _STRENGTH.get(key)
+    if cache is None:
+        if len(_STRENGTH) > 256:
+            _STRENGTH.clear()
+        cache = _STRENGTH[key] = {}
+    v = cache.get(i)
+    if v is None:
+        from .strength import postflop_strength
+        v = cache[i] = postflop_strength(list(COMBOS[i]), list(board))
+    return v
 
 
 class RangeTracker:
@@ -184,24 +196,25 @@ class RangeTracker:
         return Range()                                    # checked the big blind: anything
 
     def range_for(self, st, seat, dead):
-        '''Opponent's current range given everything public this hand, with card removal.'''
-        key = (st.hand_id, seat, len(st.history), tuple(st.board))
-        if key in self._cache:
-            r = self._cache[key].copy()
-        else:
+        """Opponent's current range given everything public this hand, with card removal.
+
+        Kept per hand and updated incrementally: only actions since the last call are applied."""
+        key = (st.hand_id, st.names[seat], st.positions[seat], seat)
+        done, r = self._cache.get(key, (None, None))
+        if r is None:
             r = self.preflop_range(st, seat)
-            board_at = {'flop': 3, 'turn': 4, 'river': 5}
-            for a in st.history:
-                if a.street == PREFLOP or a.seat != seat:
-                    continue
-                board = st.board[:board_at[a.street]]
-                r.remove(board)
-                self._narrow(r, a.kind, board, a.to_call, a.pot)
-            r.remove(st.board)
-            if len(self._cache) > 2000:
+            done = sum(1 for a in st.history if a.street == PREFLOP)
+            if len(self._cache) > 200:
                 self._cache.clear()
-            self._cache[key] = r.copy()
-        return r.remove(dead)
+        board_at = {'flop': 3, 'turn': 4, 'river': 5}
+        for a in st.history[done:]:
+            if a.street == PREFLOP or a.seat != seat:
+                continue
+            board = st.board[:board_at[a.street]]
+            r.remove(board)
+            self._narrow(r, a.kind, board, a.to_call, a.pot)
+        self._cache[key] = (len(st.history), r)
+        return r.copy().remove(list(st.board) + list(dead))
 
     @staticmethod
     def _narrow(r, kind, board, to_call, pot):
@@ -210,7 +223,7 @@ class RangeTracker:
         for i, c in enumerate(COMBOS):
             if r.w[i] <= 0 or c[0] in board or c[1] in board:
                 continue
-            s = _combo_strength(c, board)
+            s = _combo_strength(i, board)
             if kind in (BET, RAISE):
                 f = 0.15 + 0.85 * s ** 1.5 + (0.2 if 0.25 < s < 0.5 else 0.0)   # value + some draws/bluffs
             elif kind == CALL:
