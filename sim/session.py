@@ -77,7 +77,8 @@ class _Watched:
             self.observer.before_action(self.table_seat, st)
         t0 = time.monotonic()
         action = Table._sanitize(self.inner.act(st), st)
-        self.last_think_ms = (time.monotonic() - t0) * 1000 if self.timed else None
+        self.last_think_ms = ((time.monotonic() - t0) * 1000 if self.timed
+                              else getattr(self.inner, 'last_think_ms', None))   # bots report their own
         if getattr(self.inner, 'reported_think_ms', None) is not None:     # replays / tests
             self.last_think_ms = self.inner.reported_think_ms
         if self.observer:

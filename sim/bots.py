@@ -6,6 +6,7 @@ Preflop ranges are expressed as "top X fraction of all combos" using the
 same hand ordering as misc.pf_compact. Postflop decisions compare a cheap
 strength estimate (sim/strength.py) to pot odds, plus per-bot margins.
 '''
+import math
 import random
 from dataclasses import dataclass, replace
 
@@ -13,7 +14,7 @@ from .engine import Action, PREFLOP, FLOP, FOLD, CHECK, CALL, BET, RAISE
 from . import pushfold
 from .ranges import RangeTracker, equity
 from .stats import StatsTracker
-from .cards import RANK_VALUE
+from .cards import RANK_VALUE, hand_code
 from .strength import preflop_strength, postflop_strength
 
 LATE = ('CO', 'BTN', 'SB')
@@ -167,15 +168,67 @@ class ParamBot(Bot):
             n = max(1, len(opp))
             s = eq ** (1.0 / n) if n > 1 else eq      # heads-up equivalent, so thresholds still apply
             self.last_equity = eq
+            self._last_s = s
             return s, s
         s = postflop_strength(st.hole, st.board)
+        self._last_s = s - 0.06 * (st.n_active - 2)
         return s, s - 0.06 * (st.n_active - 2)      # be more careful multiway
 
     def act(self, st):
         p = self.params_for(st)
+        self._last_s = None
+        a = self._preflop(st, p) if st.street == PREFLOP else self._postflop(st, p)
+        # how sure was it? close decisions take longer - a timing tell other players can read
+        self.last_confidence, self.last_reason = self.analyze(st, p, a)
+        self.last_think_ms = self.think_time(self.last_confidence)
+        return a
+
+    def think_time(self, confidence):
+        '''Milliseconds this bot "takes": quick when sure, slow when the decision is close.'''
+        if getattr(self, '_trng', None) is None:
+            self._trng = random.Random(hash(self.name) & 0xffff)   # separate from decision randomness
+        base = 450 + 3200 * (1.0 - confidence) ** 1.5
+        return base * math.exp(self._trng.gauss(0, 0.25))
+
+    def analyze(self, st, p, a):
+        '''(confidence 0..1, plain-English reason) for the decision just made.'''
+        clamp = lambda x: max(0.05, min(1.0, x))
         if st.street == PREFLOP:
-            return self._preflop(st, p)
-        return self._postflop(st, p)
+            top = 1.0 - preflop_strength(st.hole)
+            code = hand_code(st.hole)
+            if p.smart and pushfold.effective_stack(st) <= 25 * st.big_blind and a.kind in (RAISE, CALL, FOLD) \
+                    and (a.amount == st.max_raise_to or st.raises_this_street == 2):
+                return 0.9, 'short stack: solved push/fold chart (%s at %.0f bb)' % (
+                    code, pushfold.effective_stack(st) / st.big_blind)
+            r = st.raises_this_street
+            if r == 1:
+                rng = p.open * (1 + p.pos_spread * POS_RANK.get(st.position, 0.0))
+                if st.position in LATE:
+                    rng *= p.steal_mult
+                lines = [rng, rng + p.limp]
+                what = 'opens the top %d%% from %s' % (round(100 * min(1, rng)), st.position)
+            elif r == 2:
+                lines = [p.threebet, p.threebet + p.call_open]
+                what = '3-bets the top %d%%, continues with the top %d%%' % (
+                    round(100 * p.threebet), round(100 * min(1, p.threebet + p.call_open)))
+            else:
+                lines = [p.fourbet, p.call_3bet]
+                what = '4-bets the top %d%%' % round(100 * p.fourbet)
+            margin = min(abs(top - t) for t in lines)
+            return clamp(margin / 0.05), '%s is a top-%d%% hand; it %s' % (code, max(1, round(100 * top)), what)
+        sv = self._last_s if self._last_s is not None else postflop_strength(st.hole, st.board)
+        eq = getattr(self, 'last_equity', None) if p.smart else None
+        how = ('wins %d%% vs their likely hands' % round(100 * eq)) if eq is not None else \
+              ('hand strength %.2f' % sv)
+        if st.to_call == 0:
+            if a.kind == BET and sv < p.value:
+                return 0.45, 'bluff / c-bet mix (%s, below its value line %.2f)' % (how, p.value)
+            return clamp(abs(sv - p.value) / 0.08), '%s; bets for value from %.2f' % (how, p.value)
+        need = st.to_call / (st.pot + st.to_call) + p.call_margin + \
+            p.fear * min(st.to_call / max(1, st.pot - st.to_call), 2.0) * 0.25
+        margin = min(abs(sv - need), abs(sv - p.raise_value))
+        return clamp(margin / 0.08), '%s; needs %.2f to call (pot odds %d%%), raises from %.2f' % (
+            how, need, round(100 * st.to_call / (st.pot + st.to_call)), p.raise_value)
 
     # ---------------------------------------------------------------- preflop
     def _preflop(self, st, p):
