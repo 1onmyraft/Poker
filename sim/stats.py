@@ -29,6 +29,7 @@ STAT_INFO = {
     'fold_steal': ('FtS',    0.65, 'folded a blind to a steal'),
     'cbet':      ('CBet',    0.60, 'preflop raiser bet the flop when checked to'),
     'fold_cbet': ('FCB',     0.45, 'folded to a flop c-bet'),
+    'cbet_turn': ('CB2',     0.45, 'bet the turn again after a called flop c-bet'),
     'donk':      ('Donk',    0.10, 'led into the preflop raiser on the flop'),
     'fvb':       ('FvB',     0.45, 'folded when facing a postflop bet/raise'),
     'fvb_small': ('FvB<½',   0.40, 'folded facing a postflop bet under half pot'),
@@ -135,6 +136,7 @@ class StatsTracker:
         pfa = self._preflop_aggressor(h)
         for street in (FLOP, 'turn', 'river'):
             self._postflop_street(h, ps, street, pfa)
+        self._turn_barrel(h, ps, pfa)
 
         saw_flop = set(h.saw_street.get(FLOP, []))
         if FLOP in h.saw_street and len(saw_flop) > 1:
@@ -144,6 +146,24 @@ class StatsTracker:
                 ps[i].stats['wwsf'].add(h.winnings[i] > 0)
                 if went:
                     ps[i].stats['wsd'].add(h.winnings[i] > 0)
+
+    @staticmethod
+    def _turn_barrel(h, ps, pfa):
+        '''Second barrel: after c-betting the flop and getting called, did they bet the turn?'''
+        if pfa is None:
+            return
+        flop = [a for a in h.actions if a.street == FLOP]
+        bets = [a for a in flop if a.kind in (BET, RAISE)]
+        if not bets or bets[0].seat != pfa or len(bets) > 1:
+            return
+        if not any(a.kind == CALL for a in flop[flop.index(bets[0]) + 1:]):
+            return
+        for a in (a for a in h.actions if a.street == 'turn'):
+            if a.seat == pfa:
+                ps[pfa].stats['cbet_turn'].add(a.kind == BET)
+                return
+            if a.kind in (BET, RAISE):
+                return                      # someone bet into them first: no chance to barrel
 
     @staticmethod
     def _preflop_aggressor(h):

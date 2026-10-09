@@ -433,6 +433,8 @@ def make_bot(kind, name=None, seed=0):
         return ExploitBot(name, seed=seed, pool_mode=True)
     if kind == 'Hunter':
         return Hunter(name, seed=seed)
+    if kind == 'HunterNoWilcox':                # ablation: Hunter without the article rules
+        return Hunter(name, seed=seed, wilcox=False)
     if kind == 'HunterPool':
         return Hunter(name, seed=seed, pool_mode=True)
     if kind.startswith('Hunter:'):            # Hunter on top of another preset, e.g. 'Hunter:LAG'
@@ -457,6 +459,35 @@ def _value_iso_hand(hole):
     return r[0] == r[1] or r[0] == 14 or r[1] >= 10 or (suited and r[0] - r[1] <= 2 and r[1] >= 4)
 
 
+def _bluff_3bet_hand(hole):
+    '''Polarized 3-bet bluffs: suited connectors/one-gappers 54s+ and suited wheel aces.'''
+    r = sorted((RANK_VALUE[c[0]] for c in hole), reverse=True)
+    if hole[0][1] != hole[1][1]:
+        return False
+    return (r[0] == 14 and 2 <= r[1] <= 5) or (r[0] - r[1] <= 2 and r[1] >= 4 and r[0] <= 11)
+
+
+def _flop_dry_one_high(board):
+    '''Rainbow, unconnected flop with exactly one card ten or higher (or a paired flop with one).'''
+    if len(board) != 3 or len({c[1] for c in board}) != 3:
+        return False
+    rk = sorted((RANK_VALUE[c[0]] for c in board), reverse=True)
+    if len(set(rk)) < 3:
+        return max(rk) >= 10
+    if sum(1 for x in rk if x >= 10) != 1:
+        return False
+    return rk[0] - rk[1] >= 3 and rk[1] - rk[2] >= 3
+
+
+def _flop_wet_connected(board):
+    '''Two-tone (or monotone) and connected, e.g. JT8 with a flush draw.'''
+    if len(board) != 3:
+        return False
+    rk = sorted({RANK_VALUE[c[0]] for c in board})
+    two_tone = max(sum(1 for c in board if c[1] == s_) for s_ in 'shdc') >= 2
+    return two_tone and len(rk) == 3 and rk[-1] - rk[0] <= 4
+
+
 class Hunter(ExploitBot):
     '''
     Ante-aware baseline plus the "winning money from bad players" adjustments
@@ -474,8 +505,10 @@ class Hunter(ExploitBot):
     - Passive players' donk bets and tiny "blocking" bets are weak: raise / call wider.
     '''
 
-    def __init__(self, name, params=None, seed=0, pool_mode=False):
+    def __init__(self, name, params=None, seed=0, pool_mode=False, wilcox=True):
         super().__init__(name, params or PRESETS['Wizard'], seed=seed, pool_mode=pool_mode)
+        self.wilcox = wilcox      # the rules from the other Wilcox/HigherLevelPoker articles
+        self._float = self._xr = None
 
     # keep the baseline sizing and params; reads are applied in act()
     def params_for(self, st):
@@ -499,6 +532,10 @@ class Hunter(ExploitBot):
         return None
 
     def _preflop(self, st, p):
+        if self.wilcox and pushfold.effective_stack(st) > 25 * st.big_blind:
+            a = self._wilcox_preflop(st, p)
+            if a is not None:
+                return a
         voluntary = [a for a in st.street_actions if a.kind in (CALL, RAISE)]
         limpers = [a.seat for a in voluntary if a.kind == CALL]
         if (st.raises_this_street == 1 and limpers and st.position not in BLINDS
@@ -522,11 +559,18 @@ class Hunter(ExploitBot):
     def _postflop(self, st, p):
         others = [i for i in st.active_seats if i != st.seat]
         if len(others) != 1:
+            if (self.wilcox and st.to_call == 0 and st.street == FLOP and st.preflop_aggressor == st.seat
+                    and self.hand_strength(st, p)[1] < 0.45):
+                return Action(CHECK)            # "Continuation Betting": no c-bet bluffs multiway
             return super()._postflop(st, p)
         opp = self._opp(st, others[0])
         read = self._read(opp)
         passive = opp.rate('afq', k=20) < 0.30
         s, _ = self.hand_strength(st, p)
+        if self.wilcox:
+            a = self._wilcox_postflop(st, p, opp, others[0], s, passive)
+            if a is not None:
+                return a
         pot = st.pot
         is_pfa = st.preflop_aggressor == st.seat
         prev = {FLOP: PREFLOP, 'turn': FLOP, 'river': 'turn'}[st.street]
@@ -540,7 +584,8 @@ class Hunter(ExploitBot):
                     return self._bet(st, 0.66) if s >= p.value else Action(CHECK)
             if barreling:
                 if read == 'station' and s >= 0.60:
-                    return self._bet(st, 0.66)                     # value them three streets
+                    # "Optimal Bet Sizing": a station's calling range is inelastic - bet bigger each street
+                    return self._bet(st, {'turn': 0.8, 'river': 1.0}.get(st.street, 0.7) if self.wilcox else 0.66)
                 if st.street == 'river' and s >= 0.55 and opp.rate('wtsd', k=15) >= 0.35:
                     return self._bet(st, 0.5)                      # thin value vs showdown-happy
                 return self._bet(st, 0.55) if s >= 0.66 else Action(CHECK)   # top pair+ only
@@ -563,6 +608,123 @@ class Hunter(ExploitBot):
             return Action(CALL) if s >= st.to_call / (pot + st.to_call) + p.call_margin - 0.08 \
                 else super()._postflop(st, p)
         return super()._postflop(st, p)
+
+    # ------------------------------------------------------- Wilcox article rules
+    def _known(self, o, n=20):
+        return o.hands >= n
+
+    def _ip_vs(self, st, other):
+        '''True if we act after `other` postflop (seat 1 acts first, the button last).'''
+        n = len(st.names)
+        return (st.seat - 1) % n > (other - 1) % n
+
+    def _wilcox_preflop(self, st, p):
+        bb = st.big_blind
+        top = 1.0 - preflop_strength(st.hole)
+        r = st.raises_this_street
+        vol = [a for a in st.street_actions if a.kind in (CALL, RAISE)]
+        raises = [a for a in vol if a.kind == RAISE]
+        fold_or_check = Action(CHECK) if st.to_call == 0 else Action(FOLD)
+
+        def open_raise():
+            return Action(RAISE, int(max(bb, st.current_bet) * p.open_size))
+
+        if r == 1 and not vol:
+            blinds = [i for i, pos in enumerate(st.positions) if pos in ('SB', 'BB') and i != st.seat]
+            if st.position == 'SB' and blinds:
+                o = self._opp(st, blinds[0])
+                if self._known(o, 15):
+                    # "Playing Blind vs. Blind": open almost any two against a tight big blind
+                    v, pf, fts = o.rate('vpip', k=20), o.rate('pfr', k=20), o.rate('fold_steal', k=10)
+                    rng = 1.0 if (fts >= 0.6 or v <= 0.2) else (0.35 if (v >= 0.4 and pf <= 0.12) else 0.5)
+                    return open_raise() if top <= rng else fold_or_check
+            if st.position in ('BTN', 'CO') and blinds:
+                os_ = [self._opp(st, i) for i in blinds]
+                if all(self._known(o, 15) for o in os_) and min(o.rate('fold_steal', k=10) for o in os_) >= 0.65:
+                    # "Preflop Opening Ranges": widen the steal a lot when the blinds over-fold
+                    if top <= (0.55 if st.position == 'BTN' else 0.35):
+                        return open_raise()
+            return None
+
+        if r == 2 and len(raises) == 1:
+            o_seat = raises[0].seat
+            o = self._opp(st, o_seat)
+            if not self._known(o):
+                return None
+            v, pf, f3b = o.rate('vpip', k=20), o.rate('pfr', k=20), o.rate('fold_3bet', k=10)
+            callers = sum(1 for a in vol if a.kind == CALL)
+            three = Action(RAISE, int(st.current_bet * (3.0 if self._ip_vs(st, o_seat) else 3.5)
+                                      + st.current_bet * callers))
+            ip = self._ip_vs(st, o_seat)
+            if st.position == 'BB' and st.positions[o_seat] == 'SB' and not (pf <= 0.12 and v <= 0.18):
+                # "Playing Blind vs. Blind": defend 50%+, 3-bet 12%+ unless the SB is a nit
+                if top <= 0.12:
+                    return three
+                return Action(CALL) if top <= 0.55 else fold_or_check
+            if v >= 0.35 and pf >= 0.22:
+                # "3Betting Preflop In The Micro Stakes": 3-bet loose-aggressive fish wide in position
+                if (ip and top <= 0.30 and _value_iso_hand(st.hole)) or top <= (0.06 if ip else 0.03):
+                    return three
+                return None
+            if v >= 0.35 and pf <= 0.12:
+                # loose-passive fish who raises: strong range, no bluff 3-bets, flat good hands
+                if top <= 0.04:
+                    return three
+                return Action(CALL) if top <= 0.15 else fold_or_check
+            if v <= 0.26 and f3b >= 0.6 and ip:
+                # tight regular who folds to 3-bets: polarized - premiums plus suited bluffs
+                if top <= 0.04 or _bluff_3bet_hand(st.hole):
+                    return three
+            return None
+
+        if r == 3 and raises:
+            o = self._opp(st, raises[-1].seat)
+            if self._known(o, 30) and o.rate('three_bet', k=20) >= 0.09 and top <= 0.045:
+                # "4Betting Mathematics": vs a 9%+ 3-bettor, 4-bet/call TT+ and AQ+ is profitable
+                return Action(RAISE, int(st.current_bet * 2.3))
+        return None
+
+    def _wilcox_postflop(self, st, p, o, o_seat, s, passive):
+        flop = st.street == FLOP
+        is_pfa = st.preflop_aggressor == st.seat
+        ip = self._ip_vs(st, o_seat)
+        known = self._known(o)
+        hid = st.hand_id
+        bets = [a for a in st.street_actions if a.kind in (BET, RAISE)]
+
+        # after a check-raise bluff gets called: give up unless we improved
+        if self._xr == hid and not flop:
+            if s >= p.value:
+                return None
+            return Action(FOLD) if st.to_call else Action(CHECK)
+        # "Relative Hand Strength": a passive player's raise is the nuts or close
+        if st.to_call and bets and bets[-1].kind == RAISE and bets[-1].seat == o_seat and passive:
+            return Action(CALL) if s >= 0.85 else Action(FOLD)
+
+        if st.to_call == 0:
+            if flop and is_pfa and known and o.rate('vpip', k=20) <= 0.22 and _flop_wet_connected(st.board) \
+                    and s < 0.4:
+                return Action(CHECK)          # "Continuation Betting": this board hits a tight range
+            if st.street == 'turn' and self._float == hid and ip:
+                return self._bet(st, 0.6)     # "Floating The Flop": take it away when they check
+            return None
+
+        bet_frac = st.to_call / max(1, st.pot - st.to_call)
+        first_bet_by_pfa = flop and len(bets) == 1 and bets[0].seat == o_seat and st.preflop_aggressor == o_seat
+        if first_bet_by_pfa and known:
+            cbet = o.rate('cbet', k=10)
+            # "Floating The Flop": dry board, they c-bet a lot but rarely fire the turn
+            if (ip and _flop_dry_one_high(st.board) and cbet >= 0.6 and o.n('cbet_turn') >= 5
+                    and o.rate('cbet_turn', k=10) <= 0.45 and s >= 0.12 and bet_frac <= 1.0):
+                self._float = hid
+                return Action(CALL)
+            # "Check-Raising As A Bluff": BB vs a late-position c-bettor on a dry one-high-card flop
+            if (st.position == 'BB' and st.positions[o_seat] in LATE and _flop_dry_one_high(st.board)
+                    and cbet >= 0.65 and s < 0.4 and bet_frac <= 0.8 and st.can_raise
+                    and self.rng.random() < 0.4):
+                self._xr = hid
+                return Action(RAISE, int(st.current_bet * 2.75))
+        return None
 
     @staticmethod
     def _we_bet_and_got_called(st, street):

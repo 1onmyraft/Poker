@@ -473,6 +473,33 @@ class TestTellsAndProfile(unittest.TestCase):
         self.assertTrue(all(d[2] == 1200 for h in again.hands() for d in h['decisions']))
 
 
+class TestWilcoxRules(unittest.TestCase):
+
+    def test_board_textures(self):
+        from sim.bots import _flop_dry_one_high, _flop_wet_connected, _bluff_3bet_hand
+        self.assertTrue(_flop_dry_one_high(['Jh', '6c', '3d']))        # J63 rainbow
+        self.assertTrue(_flop_dry_one_high(['Qh', 'Qc', '4d']))        # QQ4 rainbow
+        self.assertFalse(_flop_dry_one_high(['Jh', 'Tc', '3d']))       # two high cards
+        self.assertFalse(_flop_dry_one_high(['Jh', '6h', '3d']))       # two-tone
+        self.assertTrue(_flop_wet_connected(['Jh', 'Th', '8c']))       # JT8 two-tone
+        self.assertFalse(_flop_wet_connected(['Ah', '8c', '3d']))
+        self.assertTrue(_bluff_3bet_hand(['7s', '6s']))
+        self.assertTrue(_bluff_3bet_hand(['As', '4s']))
+        self.assertFalse(_bluff_3bet_hand(['7s', '6d']))
+
+    def test_rules_fire_and_conserve_chips(self):
+        from sim.bots import Hunter
+        table = Table(big_blind=10, small_blind=10, ante=10)
+        hunter = Hunter('Hunter', seed=1)
+        bots = [hunter] + [make_bot(k, '%s%d' % (k, i), seed=i) for i, k in
+                           enumerate(['LAG', 'Station', 'Nit', 'Maniac', 'TAG', 'Nervous'])]
+        for d in range(150):
+            seats = bots[d % 7:] + bots[:d % 7]
+            h = table.play_hand(seats, deck_seed=d, hand_id=d)
+            self.assertEqual(sum(h.winnings), 0)
+        self.assertGreater(hunter.tracker.get('LAG0').n('cbet_turn'), 0)
+
+
 class TestCalibrate(unittest.TestCase):
 
     def test_distance_is_zero_on_itself_and_grows(self):
