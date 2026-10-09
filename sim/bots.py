@@ -497,6 +497,8 @@ def make_bot(kind, name=None, seed=0):
         return Hunter(name, seed=seed, pool_mode=True)
     if kind.startswith('Hunter:'):            # Hunter on top of another preset, e.g. 'Hunter:LAG'
         return Hunter(name, params=PRESETS[kind.split(':', 1)[1]], seed=seed)
+    if kind.startswith('Exploit:'):           # exploit layer on top of another preset
+        return ExploitBot(name, params=PRESETS[kind.split(':', 1)[1]], seed=seed)
     if kind.startswith('Exploit-'):
         return ExploitBot(name, seed=seed, disabled=kind.split('-')[1:])
     return ParamBot(name, PRESETS[kind], seed=seed)
