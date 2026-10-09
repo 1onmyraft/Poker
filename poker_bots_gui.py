@@ -48,7 +48,7 @@ AVATARS = ['You', 'Wizard', 'Hunter', 'AnteMax', 'Maniac', 'AnteTAG', 'Station',
            'Terrified', 'Nit', 'LAG', 'TAG', 'Exploit']
 CARD_WORD = {'A': 'Ace', 'K': 'King', 'Q': 'Queen', 'J': 'Jack', 'T': 'Ten', '9': 'Nine', '8': 'Eight',
              '7': 'Seven', '6': 'Six', '5': 'Five', '4': 'Four', '3': 'Three', '2': 'Two'}
-COACHES = ['AnteMax', 'CodexCrusher', 'Wizard', 'Hunter', 'AnteTAG', 'Off']
+COACHES = ['AnteMax', 'Wizard', 'Hunter', 'AnteTAG', 'Off']
 COACH_BG = '#2a1f4a'
 BOT_INFO = {
     'Wizard': 'thinks in ranges: knows what you could hold (card removal), equity-based decisions, solved short-stack shoves',
