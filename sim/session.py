@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from .bots import make_bot
-from .engine import Table, Action, CHECK, CALL
+from .engine import Table, Action, CHECK, CALL, PREFLOP, FLOP, TURN
 from .handhistory import write_hand
 from .stats import StatsTracker
 
@@ -27,6 +27,37 @@ BOT_CHOICES = ['Wizard', 'Hunter', 'AnteMax', 'Maniac', 'AnteTAG', 'Station', 'N
                'Terrified', 'Nit', 'LAG', 'TAG', 'Exploit']
 FISH = {'Station', 'Nervous', 'Scared', 'Terrified'}
 DEFAULT_LINEUP = ['Wizard', 'Hunter', 'AnteMax', 'Maniac', 'Station', 'Nervous']
+CASH_OUT_FEE = 0.03        # like the sample: "cashed out the hand for ₮6 | Cash Out Fee ₮0.20"
+BOARD_AT = {PREFLOP: 0, FLOP: 3, TURN: 4}
+
+
+def all_in_equity(h, seat, samples=1500, seed=0):
+    '''
+    Expected chips `seat` collects (after rake) over every runout from the point the
+    last action happened. Exact on the flop and turn, sampled preflop.
+
+    RETURN: (expected chips, chance of collecting anything, cards known on the board)
+    '''
+    from itertools import combinations
+    from .cards import DECK
+    known = BOARD_AT.get(h.actions[-1].street, 5) if h.actions else 0
+    alive = list(h.showdown)
+    dealt = {c for i in alive for c in h.hole[i]} | set(h.board[:known])
+    rest = [c for c in DECK if c not in dealt]
+    k = 5 - known
+    if k == 0:
+        return None
+    if k <= 2:
+        runouts = list(combinations(rest, k))
+    else:
+        rng = random.Random(seed)
+        runouts = [rng.sample(rest, k) for _ in range(samples)]
+    total, wins = 0.0, 0
+    for ro in runouts:
+        won, _ = Table._payout(h.hole, h.board[:known] + list(ro), h.invested, alive, h.rake)
+        total += won[seat]
+        wins += won[seat] > 0
+    return total / len(runouts), wins / len(runouts), known
 
 
 @dataclass
@@ -82,6 +113,7 @@ class _Watched:
         if getattr(self.inner, 'reported_think_ms', None) is not None:     # replays / tests
             self.last_think_ms = self.inner.reported_think_ms
         if self.observer:
+            self.observer.think_ms = self.last_think_ms        # how long the bot "thought"
             self.observer.after_action(self.table_seat, st, action)
         return action
 
@@ -89,13 +121,15 @@ class _Watched:
 class Session:
 
     def __init__(self, lineup=DEFAULT_LINEUP, structure='ante', buy_in_bb=100, human_name='You',
-                 seed=None, history_path=None, rake=0.0, rake_cap=None, label_styles=True, profile=None):
+                 seed=None, history_path=None, rake=0.0, rake_cap=None, label_styles=True, profile=None,
+                 straddle=False):
         '''
         lineup: bot kinds for the other seats (1-8 of them); the human sits in seat 0
         history_path: append every hand to this file in the 1onmyraftpoker format
         label_styles: name bots after their style ("Hunter") or anonymously ("Bot 3")
         profile: a sim.profile.Profile; bots start out knowing you from earlier sessions,
                  and every hand is added to it
+        straddle: UTG posts a 2 bb straddle every hand (4+ players), acting last preflop
         '''
         assert 1 <= len(lineup) <= 8
         self.struct = STRUCTURES[structure]
@@ -121,6 +155,8 @@ class Session:
         self.history_path = history_path
         self.started = datetime.now()
         self.profile = profile
+        self.straddle = straddle
+        self.straddler = None          # table seat straddling the current hand
         if profile is not None:
             profile.name = human_name
             profile.seed(self.tracker)
@@ -170,8 +206,17 @@ class Session:
             agents.append(_Watched(inner, t, observer))
         self.hand_no += 1
         t_start = time.time()
+        stacks = [self.seats[t].stack for t in order]
+        posts, self.straddler = [], None
+        if self.straddle and n > 3 and stacks[3] > 2 * self.bb + self.struct['ante']:
+            posts, self.straddler = [(3, 2 * self.bb, 'straddle')], order[3]
         h = self.table.play_hand(agents, deck_seed=self.rng.randrange(10 ** 12), hand_id=self.hand_no,
-                                 stacks=[self.seats[t].stack for t in order])
+                                 stacks=stacks, posts=posts)
+        h.cashouts = {}
+        offer = self.cash_out_offer(h, order)
+        if offer and observer is not None and getattr(observer, 'offer_cash_out', None):
+            if observer.offer_cash_out(offer):
+                self.take_cash_out(h, offer)
         net = {}
         for j, t in enumerate(order):
             self.seats[t].stack += h.winnings[j]
@@ -185,11 +230,39 @@ class Session:
         self.button = (self.button + 1) % n
         return HandResult(h, order, net)
 
+    def cash_out_offer(self, h, order):
+        '''
+        Insurance / "All-in Cash Out": when you are all-in at showdown with cards still to
+        come, the house offers to buy your share of the pot at its fair value minus a 3% fee.
+        The price comes from every possible runout, so taking it never changes your
+        expected result by more than the fee; it only removes the swing.
+
+        RETURN: dict(seat, payout, fee, fair, win_chance, known) or None
+        '''
+        seat = order.index(0)
+        if seat not in h.showdown or not h.actions:
+            return None
+        eq = all_in_equity(h, seat, seed=h.hand_id)
+        if eq is None or eq[0] <= 0:
+            return None
+        fair, win, known = eq
+        payout = int(fair / (1 + CASH_OUT_FEE))
+        return dict(seat=seat, payout=payout, fee=int(round(fair)) - payout, fair=fair, win_chance=win,
+                    known=known, board=h.board[:known], invested=h.invested[seat],
+                    hands={order[j]: h.hole[j] for j in h.showdown})
+
+    @staticmethod
+    def take_cash_out(h, offer):
+        '''You get the payout; the house takes your share of whatever the runout gives.'''
+        seat = offer['seat']
+        h.cashouts[seat] = (offer['payout'], offer['fee'])
+        h.winnings[seat] = offer['payout'] - h.invested[seat]
+
     def _save(self, h, order):
         hero = order.index(0)
         text = write_hand(h, self.hand_no, datetime.now(), 'home', [t + 1 for t in order],
                           max_seats=len(self.seats), sb=self.struct['small_blind'], bb=self.bb,
-                          ante=self.struct['ante'], hero=hero,
+                          ante=self.struct['ante'], hero=hero, cashouts=h.cashouts,
                           names=['Hero' if t == 0 else self.seats[t].name.replace(': ', '_').replace(' ', '_') for t in order])
         os.makedirs(os.path.dirname(os.path.abspath(self.history_path)), exist_ok=True)
         with open(self.history_path, 'a', encoding='utf-8') as f:

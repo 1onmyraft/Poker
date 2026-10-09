@@ -329,6 +329,42 @@ class TestSession(unittest.TestCase):
         self.assertEqual(sum(ph.net('Hero') for ph in hands), s.human.won)
 
 
+    def test_straddle_and_cash_out(self):
+        import os
+        import tempfile
+        from sim.session import Session, CallingHuman
+        path = os.path.join(tempfile.mkdtemp(), 'h.txt')
+        s = Session(['Maniac', 'Maniac', 'AnteMax', 'Station', 'LAG'], seed=5, history_path=path, straddle=True)
+        offers = []
+
+        class Taker:
+            think_ms = None
+
+            def before_action(self, t, st):
+                pass
+
+            def after_action(self, t, st, a):
+                pass
+
+            def offer_cash_out(self, offer):
+                offers.append(offer)
+                assert 0 < offer['payout'] <= offer['fair'] and offer['fee'] >= 0, offer
+                return len(offers) % 2 == 1          # take every other offer
+
+        for _ in range(80):
+            s.play_hand(CallingHuman(), observer=Taker())
+        self.assertGreater(len(offers), 3)
+        with open(path, encoding='utf-8') as f:
+            text = f.read()
+        hands = parse_hands(text)
+        self.assertEqual(len(hands), 80)
+        self.assertIn('STRADDLE', text)
+        self.assertIn('cashed out the hand for', text)
+        for ph in hands:
+            replay(ph)
+        self.assertEqual(sum(ph.net('Hero') for ph in hands), s.human.won)
+
+
 class TestPngFallback(unittest.TestCase):
 
     def test_decoder_reads_all_resources(self):

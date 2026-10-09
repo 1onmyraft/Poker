@@ -36,8 +36,25 @@ you between sessions. **My profile** shows what the game has learned about you: 
 speed, timing tells, tilt, results by session length, breaks and position. It's stored only in
 `history/profile.json` on your computer.
 
+**Coach.** The purple bar under the status bar shows what a bot of your choice (AnteMax by
+default; pick another or Off at the top right, H hides it) would do in your spot, how sure it is,
+and why ("A9s is a top-12% hand; it opens the top 64% from CO"). If it would bet or raise, the
+amount box is pre-filled with its size. It also reads the table's timing: bots think longer when
+their decision is close (`ParamBot.analyze` scores the margin to their thresholds) and snap when
+it's easy, so the coach points out "Maniac tanked 3.1s on the call (a close decision: usually a
+medium hand)", and uses showdown history to say when slow has meant strong for a player. Each
+bot's thinking time is also shown in the log (`[2.8s, slow for them]`).
+
+**Straddle and insurance.** Tick *Straddle* when starting a session and UTG posts 2 big blinds
+every hand and acts last preflop. When you're all-in with cards to come, the game offers
+**insurance** (the "All-in Cash Out" from the sample histories): your share of the pot at its fair
+value over every possible runout, minus a 3% fee. Press O to take it or Enter to run it. The
+coach always says run it, because the fee is the only thing the deal changes on average; it only
+removes the swing. Cash-outs are saved in the history as `Hero cashed out the hand for ₮X | Cash
+Out Fee ₮Y`, exactly like the sample.
+
 Keys: F fold, C or Space check/call, R bet/raise, 1-4 bet sizes (½, ⅔, pot, all-in), Up/Down
-adjust by a big blind, Enter or Space next hand. Any Python 3.8+ with tkinter works,
+adjust by a big blind, Enter or Space next hand, H coach on/off, O take the cash out. Any Python 3.8+ with tkinter works,
 including the one bundled with Xcode/macOS: its old Tk 8.5 can't read PNG, so the GUI then loads
 the card images with Pillow if installed, or its own small PNG decoder (about a second at start-up).
 A python.org Python (Tk 8.6) looks and behaves best on macOS; on Linux install `python3-tk`.

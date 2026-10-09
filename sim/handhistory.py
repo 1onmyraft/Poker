@@ -42,13 +42,15 @@ def anon_name(rng):
 # --------------------------------------------------------------------------- writer
 
 def write_hand(h, hand_no, when, table_name, seat_numbers, max_seats=7, sb=10, bb=10, ante=10,
-               hero=None, names=None):
+               hero=None, names=None, cashouts=None):
     '''
     PARAMETERS:
         h: engine HandHistory (engine seat 0 = button)
         seat_numbers: table seat number for each engine seat
         hero: engine seat whose hole cards are shown in "Dealt to" (None = nobody)
         names: display name per engine seat (defaults to h.names)
+        cashouts: {engine seat: (payout, fee)} for players who took the all-in cash out;
+                  the house keeps whatever they would have collected
 
     RETURN: string
     '''
@@ -113,6 +115,7 @@ def write_hand(h, hand_no, when, table_name, seat_numbers, max_seats=7, sb=10, b
                 out.append('%s: RETURN %s' % (names[seat], money(amt)))
 
     out.append('*** SHOWDOWN ***')
+    cashouts = cashouts or {}
     shown = set()
     won_total = [0] * n
     for award in h.pot_awards:
@@ -120,12 +123,14 @@ def write_hand(h, hand_no, when, table_name, seat_numbers, max_seats=7, sb=10, b
             if seat in h.showdown and seat not in shown:
                 shown.add(seat)
                 out.append('%s: shows [%s] (%s)' % (names[seat], ' '.join(h.hole[seat]), _hand_name(h, seat)))
-            if amt:
+            if amt and seat not in cashouts:
                 out.append('%s collected %s from pot' % (names[seat], money(amt)))
-            won_total[seat] += amt
+                won_total[seat] += amt
     for seat in h.showdown:
         if seat not in shown:
             out.append('%s: shows [%s] (%s)' % (names[seat], ' '.join(h.hole[seat]), _hand_name(h, seat)))
+    for seat, (paid, fee) in cashouts.items():
+        out.append('%s cashed out the hand for %s | Cash Out Fee %s' % (names[seat], money(paid), money(fee)))
 
     out.append('*** SUMMARY ***')
     out.append('Total pot %s | Rake %s' % (money(sum(h.invested)), money(h.rake)))
@@ -134,7 +139,10 @@ def write_hand(h, hand_no, when, table_name, seat_numbers, max_seats=7, sb=10, b
     out.append('Game ended: %s PDT' % (when + timedelta(seconds=45)).strftime('%Y/%m/%d %H:%M:%S'))
     for i in order:
         line = 'Seat %d: %s ' % (seat_numbers[i], names[i])
-        if i in h.showdown:
+        if i in cashouts:
+            line += 'showed [%s] and cashed out for %s | Cash Out Fee %s' % (
+                ' '.join(h.hole[i]), money(cashouts[i][0]), money(cashouts[i][1]))
+        elif i in h.showdown:
             cards = ' '.join(h.hole[i])
             if won_total[i]:
                 line += 'showed [%s] and won (%s) with %s' % (cards, money(won_total[i]), _hand_name(h, i))

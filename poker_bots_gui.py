@@ -8,7 +8,8 @@ evaluation come from sim/. Every hand can be saved in the 1onmyraftpoker text fo
 (history/), so `python -m sim.backtest history/<file>.txt` scores your own play.
 
 Keys: F fold, C or Space check/call, R raise, 1-4 bet sizes, Up/Down adjust the
-amount by a big blind, Enter or Space next hand.
+amount by a big blind, Enter or Space next hand, H show/hide the coach,
+O take the all-in cash out (insurance) when it is offered.
 Options: --draw-cards (draw cards as shapes), --selftest, --diagnose.
 '''
 import math
@@ -24,8 +25,9 @@ from tkinter import ttk, messagebox
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from sim.cards import describe, best_five, hand_code, evaluate, PF_PERCENTILE   # noqa: E402
-from sim.engine import Action, FOLD, CHECK, CALL, BET, RAISE        # noqa: E402
-from sim.session import Session, STRUCTURES, BOT_CHOICES, DEFAULT_LINEUP  # noqa: E402
+from sim.engine import Action, Table, FOLD, CHECK, CALL, BET, RAISE  # noqa: E402
+from sim.session import Session, STRUCTURES, BOT_CHOICES, DEFAULT_LINEUP, CASH_OUT_FEE  # noqa: E402
+from sim.bots import make_bot, PRESETS                              # noqa: E402
 from sim.profile import Profile                                     # noqa: E402
 from sim.ranges import RangeTracker, equity                         # noqa: E402
 from sim.strength import _draws                                     # noqa: E402
@@ -40,11 +42,14 @@ ROOM_RGB = (0x0b, 0x3d, 0x2e)
 FELT = ROOM
 TABLE_FELT_RGB = (0x1a, 0xbc, 0x9c)
 BASE_PAUSE = 850                 # ms a bot's action stays on screen at Normal speed
+MAX_THINK_MS = 4500              # longest a bot's thinking dots run at Normal speed
 SPEEDS = {'Slow': 1.6, 'Normal': 1.0, 'Fast': 0.45, 'Instant': 0.0}
 AVATARS = ['You', 'Wizard', 'Hunter', 'AnteMax', 'Maniac', 'AnteTAG', 'Station', 'Nervous', 'Scared',
            'Terrified', 'Nit', 'LAG', 'TAG', 'Exploit']
 CARD_WORD = {'A': 'Ace', 'K': 'King', 'Q': 'Queen', 'J': 'Jack', 'T': 'Ten', '9': 'Nine', '8': 'Eight',
              '7': 'Seven', '6': 'Six', '5': 'Five', '4': 'Four', '3': 'Three', '2': 'Two'}
+COACHES = ['AnteMax', 'CodexCrusher', 'Wizard', 'Hunter', 'AnteTAG', 'Off']
+COACH_BG = '#2a1f4a'
 BOT_INFO = {
     'Wizard': 'thinks in ranges: knows what you could hold (card removal), equity-based decisions, solved short-stack shoves',
     'Hunter': 'Wizard + reads: isolates limpers, c-bets folders, value-bets stations',
@@ -279,6 +284,11 @@ class PokerApp:
         self.speed = tk.StringVar(value='Normal')
         self.auto_deal = tk.BooleanVar(value=False)
         self.bankroll_shown = 0
+        self.coach_kind = tk.StringVar(value='AnteMax')
+        self.coach = None
+        self.think_ms = None              # set by the session before each after_action
+        self.cash_choice = tk.StringVar()
+        self.cash_offer_open = False
         self.build_ui()
         self.bind_keys()
         self.bring_to_front()
@@ -341,6 +351,11 @@ class PokerApp:
         ttk.Combobox(top, textvariable=self.speed, values=list(SPEEDS), width=8,
                      state='readonly').pack(side='right')
         tk.Label(top, text='Speed:', fg='white', bg=ROOM).pack(side='right', padx=(10, 2))
+        coaches = [c for c in COACHES if c in PRESETS or c in ('Hunter', 'Off')]
+        ttk.Combobox(top, textvariable=self.coach_kind, values=coaches, width=12,
+                     state='readonly').pack(side='right')
+        tk.Label(top, text='Coach [H]:', fg='#d1c4e9', bg=ROOM).pack(side='right', padx=(10, 2))
+        self.coach_kind.trace_add('write', lambda *_a: self.refresh_coach())
 
         self.canvas = tk.Canvas(self.root, width=W, height=H, bg=ROOM, highlightthickness=0)
         self.canvas.pack(padx=10, pady=(6, 0))
@@ -355,6 +370,15 @@ class PokerApp:
                                anchor='w', padx=14, wraplength=W - 30, justify='left')
         self.status.pack(fill='both', expand=True)
         self.status_bar = bar
+        # coach: what the chosen bot would do here, how sure it is, and timing reads.
+        # Fixed height for the same reason as the status bar.
+        cbar = tk.Frame(self.root, bg=COACH_BG, height=52)
+        cbar.pack(fill='x', padx=10, pady=(3, 0))
+        cbar.pack_propagate(False)
+        self.coach_lbl = tk.Label(cbar, text='', bg=COACH_BG, fg='#e1d5ff', font=('Helvetica', 12),
+                                  anchor='w', padx=14, wraplength=W - 30, justify='left')
+        self.coach_lbl.pack(fill='both', expand=True)
+        self.coach_shown = True
         self.hover_seat = None
         self.hover_job = None
         self.status_text = ''
@@ -410,6 +434,16 @@ class PokerApp:
         if self.dialog_open or self.session is None:
             return
         k = (e.keysym or '').lower()
+        if k == 'h' and not self.focus_in_entry():
+            self.coach_shown = not self.coach_shown
+            self.refresh_coach()
+            return
+        if self.cash_offer_open:
+            if k == 'o':
+                self.cash_choice.set('cash')
+            elif k in ('r', 'return', 'kp_enter', 'space'):
+                self.cash_choice.set('run')
+            return
         if self.hero_turn:
             if k == 'f':
                 self.press(self.b_fold, 'fold')
@@ -514,12 +548,15 @@ class PokerApp:
 
         styles = tk.BooleanVar(value=True)
         save = tk.BooleanVar(value=True)
+        straddle = tk.BooleanVar(value=False)
+        tk.Checkbutton(d, text='Straddle: UTG posts 2 big blinds every hand and acts last preflop (4+ players)',
+                       variable=straddle).grid(row=13, column=0, columnspan=4, sticky='w', padx=10, pady=(10, 0))
         tk.Checkbutton(d, text='Show bot styles in their names (untick to practise reading them from the HUD)',
-                       variable=styles).grid(row=13, column=0, columnspan=4, sticky='w', padx=10, pady=(10, 0))
+                       variable=styles).grid(row=14, column=0, columnspan=4, sticky='w', padx=10)
         tk.Checkbutton(d, text='Save my hands to history/ (1onmyraftpoker format, for sim.backtest)',
-                       variable=save).grid(row=14, column=0, columnspan=4, sticky='w', padx=10)
+                       variable=save).grid(row=15, column=0, columnspan=4, sticky='w', padx=10)
         tk.Label(d, fg='#555', justify='left', text='Keys: F fold · C or Space check/call · R raise · 1-4 bet sizes '
-                 '· ↑/↓ adjust by 1 bb · Enter or Space next hand').grid(row=15, column=0, columnspan=4, sticky='w', padx=10)
+                 '· ↑/↓ adjust by 1 bb · Enter or Space next hand · H coach · O cash out when offered').grid(row=16, column=0, columnspan=4, sticky='w', padx=10)
 
         def start():
             lineup = [v.get() for v in kinds if v.get() != '(empty)']
@@ -533,7 +570,9 @@ class PokerApp:
                 self.profile.end_session()
             self.profile = Profile(PROFILE_PATH)
             self.session = Session(lineup, structure=struct.get(), buy_in_bb=int(buy.get()),
-                                   history_path=path, label_styles=styles.get(), profile=self.profile)
+                                   history_path=path, label_styles=styles.get(), profile=self.profile,
+                                   straddle=straddle.get())
+            self.coach = None
             known = self.session.tracker.get('You').hands
             if known:
                 self.log('The bots remember you: %d hands from earlier sessions (see My profile).' % known, 'info')
@@ -554,7 +593,7 @@ class PokerApp:
             self.b_next.configure(state='normal')
             self.next_hand()
 
-        tk.Button(d, text='Start', width=14, command=start).grid(row=16, column=0, columnspan=4, pady=12)
+        tk.Button(d, text='Start', width=14, command=start).grid(row=17, column=0, columnspan=4, pady=12)
         d.bind('<Return>', lambda e: start())
 
     def small_avatar(self, kind):
@@ -960,6 +999,19 @@ class PokerApp:
             d['bets'][t] += amt
             d['labels'][t] = ('SB %s' % money(amt) if t == sb_t else 'BB %s' % money(amt), '#455a64')
         self.draw()
+        if s.straddler is not None:
+            t = s.straddler
+            amt = min(2 * s.bb, d['stacks'][t])
+            self.sleep(250 * self.k())
+            if self.k() > 0:
+                self.chips_fly(t, (self.bet_spot(t)[0] - 14, self.bet_spot(t)[1]), amt, 260)
+                self.canvas.delete('anim')
+            d['stacks'][t] -= amt
+            d['bets'][t] += amt
+            d['labels'][t] = ('Straddle %s' % money(amt), '#6a1b9a')
+            self.draw()
+            self.log('%-14s straddles %s (acts last preflop)' % (s.seats[t].name, money(amt)),
+                     'hero' if t == 0 else 'bot')
         # deal: two rounds, starting left of the button
         dealt = {}
         for rnd in range(2):
@@ -990,7 +1042,6 @@ class PokerApp:
         if t != 0:
             seat = self.session.seats[t]
             self.say('%s is thinking...' % seat.name, '#cfd8dc')
-            self.think(t, 0.45 * BASE_PAUSE * self.k())
 
     def think(self, t, ms):
         '''Pulsing dots in the acting bot's panel.'''
@@ -1033,6 +1084,10 @@ class PokerApp:
         d = self.disp
         s = self.session
         name = s.seats[t].name
+        think = self.think_ms if t != 0 else None
+        if think:
+            # bots take longer when the decision is close for them: watch for it
+            self.think(t, min(think, MAX_THINK_MS) * self.k())
         d['actor'] = None
         if a.kind == FOLD:
             txt, pill = 'folds', ('Fold', '#616161')
@@ -1067,7 +1122,10 @@ class PokerApp:
         d['labels'][t] = pill
         self.draw()
         line = '%s %s' % (name, txt)
-        self.log('%-14s %s' % (name, txt), 'hero' if t == 0 else 'bot')
+        took = ''
+        if think:
+            took = '   [%.1fs%s]' % (think / 1000.0, self.speed_word(t, a, think))
+        self.log('%-14s %s%s' % (name, txt, took), 'hero' if t == 0 else 'bot')
         if t != 0:
             self.say(line, '#ffffff')
             self.sleep(0.55 * BASE_PAUSE * self.k())
@@ -1077,6 +1135,7 @@ class PokerApp:
         self.hero_turn = True
         legal = st.legal()
         self.say(self.hand_help(st), '#ffffff', '#1e4d8c')
+        advice = self.refresh_coach()
         self.set_controls(True)
         self.b_fold.configure(state='normal' if FOLD in legal else 'disabled')
         self.b_call.configure(text=('Call %s  [C]' % money(st.to_call)) if st.to_call else 'Check  [C]')
@@ -1086,6 +1145,8 @@ class PokerApp:
         if can_raise:
             self.scale.configure(from_=st.min_raise_to, to=st.max_raise_to)
             self.amount.set(min(st.max_raise_to, max(st.min_raise_to, self.preset_amount(0.667))))
+            if advice and advice[0].kind in (BET, RAISE):       # pre-fill the coach's size
+                self.amount.set(min(st.max_raise_to, max(st.min_raise_to, advice[0].amount)))
             self.update_raise_label()
         else:
             self.b_raise.configure(text='Raise  [R]')
@@ -1093,6 +1154,7 @@ class PokerApp:
         self.root.wait_variable(self.choice)
         self.hero_turn = False
         self.set_controls(False)
+        self.coach_say('')
         if self.closing:
             raise QuitGame
         c = self.choice.get()
@@ -1105,6 +1167,156 @@ class PokerApp:
         except (tk.TclError, ValueError):
             amt = st.min_raise_to
         return Action(RAISE if st.current_bet else BET, max(st.min_raise_to, min(amt, st.max_raise_to)))
+
+    # ================================================================ coach
+    def coach_bot(self):
+        kind = self.coach_kind.get()
+        if kind == 'Off' or self.session is None:
+            return None
+        if self.coach is None or getattr(self, 'coach_for', None) != (kind, id(self.session)):
+            bot = make_bot(kind, self.session.human.name, seed=1)
+            # the coach sees what you see: the table's stats and timing reads
+            if hasattr(bot, 'tracker') or getattr(getattr(bot, 'p', None), 'smart', False):
+                bot.tracker = self.session.tracker
+            self.coach, self.coach_for = bot, (kind, id(self.session))
+        return self.coach
+
+    def coach_advice(self, st):
+        """(action, confidence, reason) from the coach bot for this spot, or None."""
+        bot = self.coach_bot()
+        if bot is None:
+            return None
+        try:
+            bot.rng = random.Random(st.hand_id * 1000 + len(st.history))   # same advice if asked twice
+            a = Table._sanitize(bot.act(st), st)
+            return a, getattr(bot, 'last_confidence', None), getattr(bot, 'last_reason', '')
+        except Exception:              # never let a hint break the game
+            return None
+
+    @staticmethod
+    def action_words(a, st):
+        if a.kind == FOLD:
+            return 'FOLD'
+        if a.kind == CHECK:
+            return 'CHECK'
+        if a.kind == CALL:
+            return 'CALL %s' % money(st.to_call)
+        allin = ' (all-in)' if a.amount >= st.max_raise_to else ''
+        return '%s %s%s' % ('BET' if a.kind == BET else 'RAISE to', money(a.amount), allin)
+
+    def speed_word(self, t, a, think):
+        """' slow'/' fast' when this was unusual for the player, judged from their history."""
+        z = self.session.tracker.timing(self.session.seats[t].name).z(a.kind, think)
+        return ', slow for them' if z >= 1.0 else (', fast for them' if z <= -1.0 else '')
+
+    def timing_reads(self, st):
+        """Plain-English reads on how long opponents took this hand."""
+        last = {}
+        for e in st.history:
+            if e.seat != st.seat and e.seat in st.active_seats and getattr(e, 'think_ms', None):
+                last[e.seat] = e
+        reads = []
+        for seat, e in last.items():
+            name = st.names[seat]
+            tm = self.session.tracker.timing(name)
+            z = tm.z(e.kind, e.think_ms)
+            if abs(z) < 1.0:
+                continue
+            corr, n = tm.tell(e.kind)
+            verb = {FOLD: 'fold', CHECK: 'check', CALL: 'call', BET: 'bet', RAISE: 'raise'}.get(e.kind, e.kind)
+            if z > 0:
+                text = '%s tanked %.1fs on the %s' % (name, e.think_ms / 1000.0, verb)
+                meaning = ('slow has meant STRONG for them' if corr > 0.2 else 'slow has meant weak for them'
+                           if corr < -0.2 else 'a close decision: usually a medium hand')
+            else:
+                text = '%s snapped %.1fs on the %s' % (name, e.think_ms / 1000.0, verb)
+                meaning = ('fast has meant weak for them' if corr > 0.2 else 'fast has meant strong for them'
+                           if corr < -0.2 else 'an easy decision: very strong or giving up')
+            reads.append((abs(z), '%s (%s)' % (text, meaning)))
+        return [r for _, r in sorted(reads, reverse=True)[:2]]
+
+    def coach_say(self, text):
+        self.coach_lbl.configure(text=text)
+
+    def refresh_coach(self):
+        """Update the coach panel for the current spot. Returns the advice (or None)."""
+        if not self.coach_shown:
+            self.coach_say('Coach hidden — press H to show it.')
+            return None
+        if not (self.hero_turn and self.cur is not None):
+            if self.coach_kind.get() == 'Off':
+                self.coach_say('Coach off. Pick one at the top right.')
+            else:
+                self.coach_say('Coach (%s) will suggest a play on your turn.' % self.coach_kind.get())
+            return None
+        st = self.cur
+        advice = self.coach_advice(st)
+        if advice is None:
+            self.coach_say('Coach off.' if self.coach_kind.get() == 'Off' else '')
+            return None
+        a, conf, reason = advice
+        if conf is None:
+            sure = ''
+        elif conf >= 0.75:
+            sure = 'clear-cut (%d%% sure)' % round(100 * conf)
+        elif conf >= 0.4:
+            sure = 'leaning (%d%% sure)' % round(100 * conf)
+        else:
+            sure = 'close call (%d%% sure) — either is fine' % round(100 * conf)
+        text = 'Coach %s: %s  ·  %s\nWhy: %s' % (self.coach_kind.get(), self.action_words(a, st), sure, reason)
+        reads = self.timing_reads(st)
+        if reads:
+            text += '  ·  Reads: ' + '; '.join(reads)
+        self.coach_say(text)
+        return advice
+
+    # ====================================================== insurance / cash out
+    def offer_cash_out(self, offer):
+        """Called by the session when you are all-in with cards to come. True = take it."""
+        d = self.disp
+        self.sweep_bets()
+        for t, cards in offer['hands'].items():
+            d['cards'][t] = list(cards)
+        d['labels'] = {t: v for t, v in d['labels'].items() if t not in offer['hands']}
+        self.draw()
+        win = 100 * offer['win_chance']
+        self.say('All-in! You win %d%% of runouts. Cash out now for %s (fee %s), or run it?' % (
+            round(win), money(offer['payout']), money(offer['fee'])), '#ffe082', '#4a148c')
+        if self.coach_shown and self.coach_kind.get() != 'Off':
+            self.coach_say('Coach %s: RUN IT. The cash-out price is your fair share (%s) minus a %d%% fee, so '
+                           'taking it costs %s on average. Only cash out to cut the swing.' % (
+                               self.coach_kind.get(), money(int(round(offer['fair']))),
+                               round(100 * CASH_OUT_FEE), money(offer['fee'])))
+        c = self.canvas
+        x, y = CX, CY + 95
+        box = c.create_rectangle(x - 230, y - 34, x + 230, y + 34, fill='#1a1033', outline='#ffd54f', width=2,
+                                 tags='offer')
+        c.create_text(x, y - 18, text='INSURANCE  ·  %d%% to win  ·  pot share worth %s' % (
+            round(win), money(int(round(offer['fair'])))), fill='white', font=('Helvetica', 11, 'bold'),
+            tags='offer')
+        b1 = tk.Button(c, text='Cash out %s  [O]' % money(offer['payout']),
+                       command=lambda: self.cash_choice.set('cash'))
+        b2 = tk.Button(c, text='Run it  [Enter]', command=lambda: self.cash_choice.set('run'))
+        c.create_window(x - 85, y + 12, window=b1, tags='offer')
+        c.create_window(x + 95, y + 12, window=b2, tags='offer')
+        del box
+        self.cash_offer_open = True
+        self.cash_choice.set('')
+        try:
+            self.root.wait_variable(self.cash_choice)
+        finally:
+            self.cash_offer_open = False
+            c.delete('offer')
+            b1.destroy()
+            b2.destroy()
+        if self.closing:
+            raise QuitGame
+        took = self.cash_choice.get() == 'cash'
+        self.coach_say('')
+        if took:
+            self.log('You cash out for %s (fee %s). The house now owns your share of the pot.' % (
+                money(offer['payout']), money(offer['fee'])), 'hero')
+        return took
 
     def preset_amount(self, frac):
         st = self.cur
@@ -1177,6 +1389,14 @@ class PokerApp:
         d['actor'] = None
         board_before = len(d['board'])
         self.sweep_bets()
+        cash = getattr(h, 'cashouts', {}).get(res.order.index(0))
+        if cash:
+            start = d['stacks'][0]
+            self.tween_stack(0, start, start + cash[0], 350)
+            d['stacks'][0] = start + cash[0]
+            if self.k() > 0:
+                x, y = self.seat_xy(0)
+                self.float_text(x, y - 50, 'Cashed out %s' % money(cash[0]), '#ffd54f')
         # all-in before the river: run the board out with a little suspense
         if h.showdown and len(h.board) > board_before:
             self.say('All-in! Running out the board...', '#ff6f00')
@@ -1203,6 +1423,10 @@ class PokerApp:
         for award in h.pot_awards:
             for j, amt in award:
                 total_won[res.order[j]] = total_won.get(res.order[j], 0) + amt
+        if cash:
+            would = total_won.pop(0, 0)
+            self.log('Without the cash out you would have %s.' % (
+                'collected %s' % money(would) if would else 'lost the pot'), 'info')
         winners = {t: amt for t, amt in total_won.items() if amt}
         if winners:
             best_t = max(winners, key=winners.get)

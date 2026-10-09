@@ -211,9 +211,14 @@ class ParamBot(Bot):
                 lines = [p.threebet, p.threebet + p.call_open]
                 what = '3-bets the top %d%%, continues with the top %d%%' % (
                     round(100 * p.threebet), round(100 * min(1, p.threebet + p.call_open)))
-            else:
+            elif r == 3:
                 lines = [p.fourbet, p.call_3bet]
-                what = '4-bets the top %d%%' % round(100 * p.fourbet)
+                what = 'vs a 3-bet 4-bets the top %d%%, calls with the top %d%%' % (
+                    round(100 * p.fourbet), round(100 * max(p.fourbet, p.call_3bet)))
+            else:
+                lines = [p.fourbet * 0.6, p.fourbet]
+                what = 'vs a 4-bet+ shoves the top %.1f%%, calls the top %.1f%%' % (
+                    100 * p.fourbet * 0.6, 100 * p.fourbet)
             margin = min(abs(top - t) for t in lines)
             return clamp(margin / 0.05), '%s is a top-%d%% hand; it %s' % (code, max(1, round(100 * top)), what)
         sv = self._last_s if self._last_s is not None else postflop_strength(st.hole, st.board)
